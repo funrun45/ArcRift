@@ -159,9 +159,9 @@
       <h3>Playing</h3>
       <ul>
         <li>Press <b>Start VR session</b> and approve the administrator prompt. A PowerShell window opens; <b>leave it open</b>, it restores everything at the end.</li>
-        <li>When the status says <b>Running</b>, launch VRChat from Steam in VR mode.</li>
+        <li>When the status says <b>Running</b>, start your SteamVR game (for example from Steam in VR mode). Tested with VRChat.</li>
         <li>Optional: after Running, use <b>Proximity bypass…</b> and set <i>Bypass Proximity Sensor Check</i> to On. Close the Debug Tool before stopping.</li>
-        <li>When finished, quit VRChat, then press <b>Stop &amp; restore</b> and wait until the status says the session was restored.</li>
+        <li>When finished, quit the game, then press <b>Stop &amp; restore</b> and wait until the status says the session was restored.</li>
       </ul>
       <h3>Good to know</h3>
       <ul>
@@ -197,7 +197,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 const STATE = {
   idle:     ['Ready', 'No session running. Press Start to begin.'],
   starting: ['Starting…', 'Approve the administrator prompt. Setting up display, Meta runtime and SteamVR.'],
-  running:  ['Running', 'Launch VRChat from Steam in VR mode.'],
+  running:  ['Running', 'Start your SteamVR game (for example from Steam in VR mode).'],
   stopping: ['Stopping…', 'Restoring display, Meta runtime and settings. Leave the PowerShell window open.'],
   recovery: ['Needs recovery', 'Cleanup did not finish last time.'],
 };
@@ -250,7 +250,7 @@ function render(s) {
     ['Headset display', hs.checked ? (hs.present ? 'on' : (s.service === 'running' ? 'warn' : '')) : '', hs.checked ? (hs.present ? 'Connected' : 'Not detected') : 'Checking…'],
     ['Meta runtime', s.service === 'running' ? 'on' : (s.service === 'stopped' ? '' : 'warn'), 'Service ' + s.service + (p.meta ? ' · server running' : '')],
     ['SteamVR', p.steamvr && p.compositor ? 'on' : (p.steamvr || p.compositor ? 'warn' : ''), p.steamvr ? 'Running' : 'Not running'],
-    ['VRChat', p.vrchat ? 'on' : '', p.vrchat ? 'Running' : 'Not running'],
+    ['VR game', p.game ? 'on' : '', p.game ? s.gameName : 'None running'],
     ['Session window', p.harness ? 'on' : (s.state === 'recovery' ? 'bad' : ''), p.harness ? 'Open — do not close' : 'Closed'],
     ['Frame recorder', p.presentmon ? 'on' : '', s.presentmonAvailable ? (p.presentmon ? 'Recording' : 'Ready') : 'Not installed'],
   ];
@@ -288,8 +288,8 @@ async function action(path, confirmText) {
   poll();
 }
 $('btnStart').onclick = () => action('/api/start');
-$('btnStop').onclick = () => action('/api/stop', 'Stop the session and restore your display and Meta settings?\n\nQuit VRChat first if it is still open.');
-$('btnRecover').onclick = () => action('/api/recover', 'Run recovery now?\n\nMake sure the Rift S is plugged in, and VRChat and SteamVR are closed.');
+$('btnStop').onclick = () => action('/api/stop', 'Stop the session and restore your display and Meta settings?\n\nQuit your game first if it is still open.');
+$('btnRecover').onclick = () => action('/api/recover', 'Run recovery now?\n\nMake sure the Rift S is plugged in, and your game and SteamVR are closed.');
 $('btnDebug').onclick = () => action('/api/debug-tool');
 $('btnFolder').onclick = () => call('/api/open-folder?which=session');
 

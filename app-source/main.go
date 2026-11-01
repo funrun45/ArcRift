@@ -29,7 +29,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const appVersion = "1.1.0"
+const appVersion = "1.1.1"
 
 var (
 	root      string
@@ -230,6 +230,25 @@ func hiccups(dir string) hiccupSummary {
 	return h
 }
 
+var reSceneApp = regexp.MustCompile(`New Connect message from (.+?\.exe) \(VRApplication_Scene\)`)
+
+// currentGame returns the VR game SteamVR last saw connect as a scene app, if that program is still running.
+func currentGame(procs map[string][]uint32) string {
+	if len(procs["vrserver.exe"]) == 0 {
+		return ""
+	}
+	log := filepath.Join(os.Getenv("ProgramFiles(x86)"), `Steam\logs\vrserver.txt`)
+	m := reSceneApp.FindAllStringSubmatch(readText(log, 512*1024), -1)
+	if len(m) == 0 {
+		return ""
+	}
+	exe := filepath.Base(strings.ReplaceAll(m[len(m)-1][1], "/", `\`))
+	if len(procs[strings.ToLower(exe)]) == 0 {
+		return ""
+	}
+	return strings.TrimSuffix(exe, filepath.Ext(exe))
+}
+
 // ---------- slow checks (service, headset presence) ----------
 
 type identity struct {
@@ -357,12 +376,14 @@ func status() map[string]any {
 		s["lastReason"] = reason
 		s["lastName"] = filepath.Base(logDir)
 	}
+	game := currentGame(procs)
+	s["gameName"] = game
 	s["processes"] = map[string]bool{
 		"harness":    harnessAlive,
 		"meta":       has("OVRServer_x64.exe"),
 		"steamvr":    has("vrserver.exe"),
 		"compositor": has("vrcompositor.exe"),
-		"vrchat":     has("VRChat.exe"),
+		"game":       game != "",
 		"debugTool":  has("OculusDebugTool.exe"),
 		"presentmon": has("PresentMon.exe"),
 	}
@@ -478,7 +499,7 @@ func openDebugTool() string {
 	} {
 		if fileExists(p) {
 			exec.Command(p).Start()
-			return "Oculus Debug Tool opened. Set 'Bypass Proximity Sensor Check' to On (after VRChat ready), and close it before stopping."
+			return "Oculus Debug Tool opened. Set 'Bypass Proximity Sensor Check' to On (after the session says Running), and close it before stopping."
 		}
 	}
 	return "Oculus Debug Tool was not found in the Meta Horizon folder."

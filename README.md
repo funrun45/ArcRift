@@ -1,9 +1,11 @@
-# ArcRift 1.1: Oculus Rift S on Intel Arc
+# ArcRift 1.1.1: Oculus Rift S on Intel Arc
 
 by **funrun** · free and open source (MIT)
 
+![ArcRift Control](docs/arcrift-control.png)
+
 ArcRift runs an **Oculus Rift S** on an **Intel Arc** graphics card, a combination Meta does not support,
-so you can play **SteamVR games such as VRChat**. It is a community workaround. It is not made or supported
+so you can play **SteamVR games** (tested with VRChat). It is a community workaround. It is not made or supported
 by Meta, Oculus, Intel or Valve.
 
 > **Experimental, use at your own risk.** While a session runs, ArcRift temporarily changes Windows display
@@ -33,17 +35,17 @@ by Meta, Oculus, Intel or Valve.
 
 1. **Dashboard → Start VR session**, then approve the administrator prompt. A PowerShell window opens.
    **Leave it open**: it restores everything at the end. SteamVR starts automatically.
-2. When the status says **Running**, start VRChat from Steam in VR mode.
+2. When the status says **Running**, start your SteamVR game (for example from Steam in VR mode).
 3. Optional: press **Proximity bypass…** and set *Bypass Proximity Sensor Check* to **On** (do this after Running;
    close the Debug Tool before stopping).
-4. When you're done: quit VRChat, then press **Stop & restore** and wait until the session shows as restored.
+4. When you're done: quit the game, then press **Stop & restore** and wait until the session shows as restored.
 
 ## Safety rules
 
 - **Never close the administrator PowerShell window** during a session.
 - **Never run two copies of ArcRift at the same time.**
 - If that window closed or crashed before cleanup finished, the app shows **Needs recovery**: plug in the
-  headset, close VRChat and SteamVR, and press **Recover**.
+  headset, close your game and SteamVR, and press **Recover**.
 - If you see lag, smearing or garbled pixels, take the headset off and press **Stop & restore** right away.
 
 ## What a session does by itself

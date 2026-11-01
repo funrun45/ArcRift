@@ -165,7 +165,7 @@ try {
             $savedTools = $root
             if ($DashboardNormalUserTrial) {
                 if ($VRChatTrial) {
-                    Write-Output 'VRChat variant: exact original DLL/EDID and menu-working normal-user launch; user launches normally. No game/anti-cheat changes. Duration policy follows.'
+                    Write-Output 'ArcRift session: Rift S bridge with normal-user SteamVR launch. No game files or anti-cheat are touched.'
                 } else {
                     Write-Output 'Dashboard IPC trial: EXACT original DLL/native helper/EDID; SteamVR runs as normal user to match Steam. Sequenced diagnostic, 30 seconds, no games, full rollback. Desktop baseline untouched.'
                 }
@@ -223,7 +223,7 @@ try {
             if ([ArcRiftIntegrityProbe]::Integrity($p.Id) -ne 8192) { throw ('Participant is not Medium integrity: ' + $p.Name) }
         }
         if ($VRChatTrial) {
-            if ($ManualSession) { Write-Output 'MANUAL-STOP SESSION: no duration cutoff. Startup/stall/error guards remain. Quit VRChat, run this folder stop-arc-rift.cmd, and wait for verified rollback. Longer gameplay UNQUALIFIED.' }
+            if ($ManualSession) { Write-Output 'Manual-stop session: no time limit. Safety guards stay active. When done, quit your game and use Stop & restore.' }
             else { Write-Output 'Normal-user preflight passed. Five-minute VRChat observation; user handles normal Steam launch/login. Close VRChat before cutoff. Games are not force-terminated by this harness.' }
         } else {
             Write-Output ('Normal-user worker preflight passed without VR. Live trial is SteamVR-only, no games, fixed ' + $SteamVRSeconds + ' seconds.')
@@ -329,24 +329,25 @@ try {
         Disable-PnpDevice -InstanceId $v.InstanceId -Confirm:$false
     }
     $start = Get-Date
-    Start-Service OVRService
-    $serverId = $null
-    for ($i = 0; $i -lt 24; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash started despite suppression; aborting.' }
-        $server = Get-Process OVRServer_x64 -ErrorAction SilentlyContinue
-        if ($server) {
-            if ($serverId -and $server.Id -ne $serverId) { throw 'VR server restarted; aborting.' }
-            $serverId = $server.Id
-        } elseif ($serverId) { throw 'VR server exited; aborting.' }
-    }
-    if (-not $serverId) { throw 'VR server did not start.' }
-    if ($guardedTrial) {
+    # Release 1.1.1: Meta looks for displays only once, right when its runtime starts. If the headset was still
+    # waking up at that moment, restart the runtime once (nothing else has been applied to the displays yet).
+    for ($metaAttempt = 1; $metaAttempt -le 2; $metaAttempt++) {
+        Start-Service OVRService
+        $serverId = $null
+        for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash started despite suppression; aborting.' }
+            $server = Get-Process OVRServer_x64 -ErrorAction SilentlyContinue
+            if ($server) {
+                if ($serverId -and $server.Id -ne $serverId) { throw 'VR server restarted; aborting.' }
+                $serverId = $server.Id
+            } elseif ($serverId) { throw 'VR server exited; aborting.' }
+        }
+        if (-not $serverId) { throw 'VR server did not start.' }
+        if (-not $guardedTrial) { break }
         $bootLog = Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogOffset)
         $candidateLogTail += $bootLog
-        # Release 1.1: Meta can be slow to enumerate displays (e.g. right after the headset was replugged).
-        # Keep waiting up to 20 s more; nothing is changed until the headset display is confirmed.
-        $enumDeadline = (Get-Date).AddSeconds(20)
+        $enumDeadline = (Get-Date).AddSeconds(8)
         while ($bootLog -notmatch ('Enumerate verified target ' + $targetId + '\b') -and (Get-Date) -lt $enumDeadline) {
             Start-Sleep -Milliseconds 500
             if (-not (Get-Process -Id $serverId -ErrorAction SilentlyContinue)) { throw 'VR server exited; aborting.' }
@@ -355,7 +356,14 @@ try {
             $bootLog += $moreBootLog
             $candidateLogTail += $moreBootLog
         }
-        if ($bootLog -notmatch ('Enumerate verified target ' + $targetId + '\b')) { throw 'Selected backend did not enumerate verified display during runtime startup; refusing timing/render changes.' }
+        if ($bootLog -match ('Enumerate verified target ' + $targetId + '\b')) { break }
+        if ($metaAttempt -eq 1) {
+            Write-Output 'Headset display was not ready when Meta started (headset still waking up). Restarting the Meta runtime once...'
+            Stop-ArcRiftMetaRuntime
+            Start-Sleep -Seconds 3
+            continue
+        }
+        throw 'Selected backend did not enumerate verified display during runtime startup; refusing timing/render changes.'
     }
     if ($LinkDiagnostics) {
         & (Join-Path $root 'igcl_probe.exe') --link-status | Out-File -Encoding utf8 (Join-Path $out 'link-before-native.txt')
@@ -654,7 +662,7 @@ try {
                 }) | ConvertTo-Json | Set-Content (Join-Path $out 'normal-dashboard-tokens.json')
                 $dashboardTrialState = [pscustomobject]@{Recorded=$true}
                 if ($VRChatTrial) {
-                    Write-Output ('Menu-working normal-user session: launch VRChat normally through Steam in VR mode, start in home/private. Stop policy: ' + $cutoffLabel + '.')
+                    Write-Output ('SteamVR is starting as your normal user. Stop policy: ' + $cutoffLabel + '.')
                 } else {
                     Write-Output 'Normal-user dashboard trial: press LEFT Touch menu button. No game launch.'
                 }
@@ -683,7 +691,7 @@ try {
                 $steamReady = $true
                 'SteamVR processes running and diagnostic output received. Optical verification is user-reported.' | Out-File (Join-Path $out 'session-ready.txt')
                 if ($VRChatTrial) {
-                    Write-Output ('VRChat ready. User launches/logs in normally. Stop policy: ' + $cutoffLabel + '. Quit game then use THIS folder stop-arc-rift.cmd, not another backup copy.')
+                    Write-Output ('VR ready. Start your SteamVR game. Stop policy: ' + $cutoffLabel + '. When done, quit the game and use Stop & restore.')
                     # v3: optional read-only frame-timing capture (PresentMon). Never affects the session.
                     $presentMonExe = Join-Path $root 'PresentMon.exe'
                     if ($ManualSession -and (Test-Path -LiteralPath $presentMonExe)) {
@@ -757,7 +765,7 @@ public static class ArcRiftGpuPriority {
         } catch { Write-Output ('PresentMon stop note (rollback unaffected): ' + $_.Exception.Message) }
     }
     if ($VRChatTrial -and (Get-Process VRChat -ErrorAction SilentlyContinue)) {
-        Write-Output 'VRChat is still running. Performing required runtime/display rollback; game itself will not be force-killed. Close it normally.'
+        Write-Output 'VRChat is still running. Restoring display and runtime now; the game is not force-closed. Close it normally.'
     }
     if ($startupSeedOwned) {
         try {
