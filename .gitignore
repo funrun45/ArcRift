@@ -1,0 +1,19 @@
+# Personal / per-machine files written by Setup and sessions (contain device IDs and the headset serial)
+arcrift-config.json
+arcrift-identity.txt
+d3d11-*/
+active-test.xml
+active-test.lock
+*.log
+
+# Build intermediates
+source/build/
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# Built programs are published as release downloads, not committed
+*.exe
+*.dll
+release-manifest.json

@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ArcRift Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1d212a; --line: #2a2f3a;
+    --text: #e7e9ee; --muted: #9aa3b2; --accent: #7aa2ff; --accent2: #5b84f0;
+    --ok: #3ccf91; --warn: #f2b84b; --bad: #ff6b6b; --idle: #6b7380;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 16px 22px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  .logo { width: 30px; height: 30px; border-radius: 8px;
+          background: conic-gradient(from 210deg, #7aa2ff, #a07bff, #3ccf91, #7aa2ff); }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .ver { color: var(--muted); font-size: 12px; }
+  nav { margin-left: auto; display: flex; gap: 4px; }
+  nav button { background: none; border: 0; color: var(--muted); padding: 7px 12px;
+               border-radius: 8px; font: inherit; cursor: pointer; }
+  nav button.on, nav button:hover { color: var(--text); background: var(--panel2); }
+  main { padding: 20px 22px; max-width: 1180px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: 380px 1fr; gap: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+             margin: 0 0 12px; font-weight: 600; }
+  .state { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .bigdot { width: 14px; height: 14px; border-radius: 50%; background: var(--idle);
+            box-shadow: 0 0 0 4px rgba(255,255,255,.04); }
+  .bigdot.running { background: var(--ok); box-shadow: 0 0 0 4px rgba(60,207,145,.18); animation: pulse 2s infinite; }
+  .bigdot.starting, .bigdot.stopping { background: var(--warn); animation: pulse 1s infinite; }
+  .bigdot.recovery { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .55; } }
+  .statename { font-size: 22px; font-weight: 600; }
+  .sub { color: var(--muted); min-height: 20px; }
+  .btns { display: grid; gap: 10px; margin-top: 16px; }
+  button.act { border: 0; border-radius: 10px; padding: 12px 14px; font: 600 14px "Segoe UI", sans-serif;
+               cursor: pointer; color: #fff; background: var(--accent2); transition: filter .15s; }
+  button.act:hover:not(:disabled) { filter: brightness(1.12); }
+  button.act:disabled { opacity: .35; cursor: not-allowed; }
+  button.act.stop { background: #c94f4f; }
+  button.act.recover { background: #b8862e; }
+  button.act.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--line); font-weight: 500; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .msg { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: var(--panel2);
+         border: 1px solid var(--line); display: none; white-space: pre-wrap; }
+  .msg.show { display: block; }
+  .msg.err { border-color: rgba(255,107,107,.5); }
+  .comps { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .comp { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border-radius: 10px; background: var(--panel2); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); flex: none; }
+  .dot.on { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  .comp small { color: var(--muted); display: block; font-size: 11.5px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+  .stat { background: var(--panel2); border-radius: 10px; padding: 10px; }
+  .stat b { font-size: 18px; display: block; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  pre.log { margin: 0; height: 360px; overflow: auto; background: #0b0d11; border: 1px solid var(--line);
+            border-radius: 10px; padding: 12px; font: 12px/1.5 Consolas, "Cascadia Mono", monospace; color: #c9cfdb; white-space: pre-wrap; }
+  .log .good { color: var(--ok); } .log .badl { color: var(--bad); } .log .note { color: var(--warn); }
+  .right { display: grid; gap: 18px; align-content: start; }
+  .banner { padding: 12px 14px; border-radius: 12px; margin-bottom: 16px; display: none; }
+  .banner.show { display: block; }
+  .banner.warn { background: rgba(242,184,75,.1); border: 1px solid rgba(242,184,75,.35); }
+  .banner.bad { background: rgba(255,107,107,.1); border: 1px solid rgba(255,107,107,.4); }
+  .hidden { display: none !important; }
+  /* setup */
+  .steps { display: flex; gap: 8px; margin-bottom: 18px; }
+  .step { flex: 1; padding: 10px; border-radius: 10px; background: var(--panel2); color: var(--muted); font-size: 13px; }
+  .step.cur { color: var(--text); outline: 1px solid var(--accent); }
+  .step.done { color: var(--ok); }
+  .wizard p { margin: 0 0 12px; }
+  .wizard .big { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  code { font-family: Consolas, monospace; font-size: 12px; background: var(--panel2); padding: 1px 5px; border-radius: 5px; word-break: break-all; }
+  .help h3 { margin: 18px 0 6px; font-size: 15px; }
+  .help ul { margin: 0; padding-left: 20px; } .help li { margin: 4px 0; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--muted); border-top-color: transparent;
+             border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"></div>
+  <div><h1>ArcRift Control</h1><div class="ver" id="ver">Rift S on Intel Arc</div></div>
+  <nav>
+    <button class="on" data-tab="dash">Dashboard</button>
+    <button data-tab="setup">Setup</button>
+    <button data-tab="help">Help</button>
+  </nav>
+</header>
+<main>
+  <div class="banner bad" id="recoverBanner"><b>Cleanup did not finish.</b> The last session's window closed before your display and Meta settings were restored. Press <b>Recover</b> (headset plugged in).</div>
+  <div class="banner warn" id="compatBanner"></div>
+
+  <section id="tab-dash">
+    <div class="grid">
+      <div class="card">
+        <h2>Session</h2>
+        <div class="state"><div class="bigdot" id="bigdot"></div><div class="statename" id="statename">…</div></div>
+        <div class="sub" id="statesub"></div>
+        <div class="btns">
+          <button class="act" id="btnStart">Start VR session</button>
+          <button class="act stop" id="btnStop">Stop &amp; restore</button>
+          <button class="act recover hidden" id="btnRecover">Recover</button>
+          <div class="row2">
+            <button class="act ghost" id="btnDebug">Proximity bypass…</button>
+            <button class="act ghost" id="btnFolder">Open session folder</button>
+          </div>
+        </div>
+        <div class="msg" id="msg"></div>
+        <div class="stats">
+          <div class="stat"><b id="sElapsed">–</b><span>Session time</span></div>
+          <div class="stat"><b id="sHitches">–</b><span>Sync hitches</span></div>
+          <div class="stat"><b id="sHeadset">–</b><span>Headset</span></div>
+        </div>
+      </div>
+      <div class="right">
+        <div class="card">
+          <h2>Components</h2>
+          <div class="comps" id="comps"></div>
+        </div>
+        <div class="card">
+          <h2 id="logTitle">Session log</h2>
+          <pre class="log" id="log">Waiting for status…</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-setup" class="hidden">
+    <div class="card wizard">
+      <h2>Headset setup</h2>
+      <div class="steps">
+        <div class="step" id="st1">1 · Plugged in</div>
+        <div class="step" id="st2">2 · Unplugged</div>
+        <div class="step" id="st3">3 · Plugged back in</div>
+        <div class="step" id="st4">4 · Result</div>
+      </div>
+      <div id="wizBody"></div>
+      <div class="btns" style="grid-template-columns: auto auto; justify-content: start;">
+        <button class="act" id="wizNext">Start</button>
+        <button class="act ghost hidden" id="wizRestart">Start over</button>
+      </div>
+      <div class="msg" id="wizMsg"></div>
+    </div>
+  </section>
+
+  <section id="tab-help" class="hidden">
+    <div class="card help">
+      <h2>How to use</h2>
+      <h3>Playing</h3>
+      <ul>
+        <li>Press <b>Start VR session</b> and approve the administrator prompt. A PowerShell window opens; <b>leave it open</b>, it restores everything at the end.</li>
+        <li>When the status says <b>Running</b>, launch VRChat from Steam in VR mode.</li>
+        <li>Optional: after Running, use <b>Proximity bypass…</b> and set <i>Bypass Proximity Sensor Check</i> to On. Close the Debug Tool before stopping.</li>
+        <li>When finished, quit VRChat, then press <b>Stop &amp; restore</b> and wait until the status says the session was restored.</li>
+      </ul>
+      <h3>Good to know</h3>
+      <ul>
+        <li>Taking the headset off pauses the freeze check; putting it back on resumes.</li>
+        <li>If the headset is put down and sits still for a while, Meta's runtime can freeze when it is picked up. The session then stops and restores itself; just start a new one.</li>
+        <li>Sessions stop automatically on real trouble (frame-rate collapse, GPU errors, Meta/SteamVR exiting) and restore your display and Meta settings.</li>
+        <li>If the PowerShell window was closed or crashed before cleanup finished, a red banner appears: press <b>Recover</b> with the headset plugged in.</li>
+        <li>Each session gets a folder (<code>d3d11-…</code>) with logs and, if PresentMon.exe is present, frame timings (<code>presentmon.csv</code>).</li>
+      </ul>
+      <h3>Never</h3>
+      <ul>
+        <li>Never close the administrator PowerShell window during a session.</li>
+        <li>Never run two copies of this folder at the same time.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<script>
+const TOKEN = location.hash.slice(1);
+const $ = id => document.getElementById(id);
+async function call(path, opts = {}) {
+  const r = await fetch(path, { method: opts.method || 'POST', headers: { 'X-ArcRift-Token': TOKEN, 'Content-Type': 'application/json' }, body: opts.body });
+  return r.json();
+}
+function showMsg(el, text, err) { el.textContent = text; el.className = 'msg show' + (err ? ' err' : ''); }
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  ['dash', 'setup', 'help'].forEach(t => $('tab-' + t).classList.toggle('hidden', t !== b.dataset.tab));
+});
+
+const STATE = {
+  idle:     ['Ready', 'No session running. Press Start to begin.'],
+  starting: ['Starting…', 'Approve the administrator prompt. Setting up display, Meta runtime and SteamVR.'],
+  running:  ['Running', 'Launch VRChat from Steam in VR mode.'],
+  stopping: ['Stopping…', 'Restoring display, Meta runtime and settings. Leave the PowerShell window open.'],
+  recovery: ['Needs recovery', 'Cleanup did not finish last time.'],
+};
+let st = null;
+
+function fmtElapsed(iso) {
+  if (!iso) return '–';
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso)) / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60;
+  return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+}
+
+function render(s) {
+  st = s;
+  $('ver').textContent = 'Rift S on Intel Arc · v' + s.version;
+  const [name, sub] = STATE[s.state] || [s.state, ''];
+  $('statename').textContent = name;
+  let subText = sub;
+  if (s.state === 'idle' && s.lastName) {
+    const r = s.lastResult === 'restored' ? 'restored ✓' : s.lastResult === 'recovered' ? 'recovered ✓' : 'result unknown';
+    subText += `\nLast session ${r}` + (s.lastReason ? ` · ${s.lastReason}` : '');
+  }
+  $('statesub').textContent = subText;
+  $('statesub').style.whiteSpace = 'pre-wrap';
+  $('bigdot').className = 'bigdot ' + s.state;
+  const compatOk = !!s.config && (!s.compatible || s.compatible.ok);
+  const missing = s.missingPrograms || [];
+  $('btnStart').disabled = s.state !== 'idle' || !compatOk || missing.length > 0;
+  $('btnStop').disabled = !(s.state === 'running' || s.state === 'starting');
+  $('btnRecover').classList.toggle('hidden', s.state !== 'recovery');
+  $('recoverBanner').classList.toggle('show', s.state === 'recovery');
+  const cb = $('compatBanner');
+  cb.className = 'banner warn';
+  if (missing.length) {
+    cb.innerHTML = '<b>The bridge programs are not built yet:</b> ' + missing.join(', ') + '. Run <b>BUILD-RELEASE.cmd</b> once (needs Visual Studio 2022 C++ Build Tools), or use a release zip that includes them.';
+    cb.className = 'banner bad show';
+  } else if (!s.config) {
+    cb.innerHTML = '<b>Run Setup first.</b> It records which headset and GPU to use. Start is disabled until then.';
+    cb.classList.add('show');
+  } else if (s.compatible && !s.compatible.ok) {
+    cb.innerHTML = '<b>Setup found a problem:</b> ' + s.compatible.issues.join(' · ') + '. Start is disabled.';
+    cb.className = 'banner bad show';
+  } else if (s.compatible && s.compatible.warnings && s.compatible.warnings.length) {
+    cb.innerHTML = '<b>Untested GPU.</b> ' + s.compatible.warnings.join(' · ') + '.';
+    cb.classList.add('show');
+  } else cb.classList.remove('show');
+
+  const p = s.processes || {}, hs = s.headset || {};
+  const comps = [
+    ['Headset display', hs.checked ? (hs.present ? 'on' : (s.service === 'running' ? 'warn' : '')) : '', hs.checked ? (hs.present ? 'Connected' : 'Not detected') : 'Checking…'],
+    ['Meta runtime', s.service === 'running' ? 'on' : (s.service === 'stopped' ? '' : 'warn'), 'Service ' + s.service + (p.meta ? ' · server running' : '')],
+    ['SteamVR', p.steamvr && p.compositor ? 'on' : (p.steamvr || p.compositor ? 'warn' : ''), p.steamvr ? 'Running' : 'Not running'],
+    ['VRChat', p.vrchat ? 'on' : '', p.vrchat ? 'Running' : 'Not running'],
+    ['Session window', p.harness ? 'on' : (s.state === 'recovery' ? 'bad' : ''), p.harness ? 'Open — do not close' : 'Closed'],
+    ['Frame recorder', p.presentmon ? 'on' : '', s.presentmonAvailable ? (p.presentmon ? 'Recording' : 'Ready') : 'Not installed'],
+  ];
+  $('comps').innerHTML = comps.map(([n, c, d]) => `<div class="comp"><div class="dot ${c}"></div><div>${n}<small>${d}</small></div></div>`).join('');
+
+  const live = s.state === 'running' || s.state === 'stopping' || s.state === 'starting';
+  $('sElapsed').textContent = live ? fmtElapsed(s.sessionStarted) : '–';
+  $('sHitches').textContent = live && s.hiccups ? s.hiccups.hitches : '–';
+  $('sHeadset').textContent = live ? (s.hiccups && s.hiccups.headsetOff ? 'Off' : 'On') : '–';
+
+  $('logTitle').textContent = s.logDir ? 'Session log · ' + s.lastName : 'Session log';
+  const log = $('log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+  const lines = (s.log || []).map(l => {
+    const e = l.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    if (/VERIFIED|ready\.|resumes/i.test(l)) return `<span class="good">${e}</span>`;
+    if (/TEST STOP|ERROR|failed/i.test(l)) return `<span class="badl">${e}</span>`;
+    if (/Headset off|hitch|burst|Performance boost|PresentMon/i.test(l)) return `<span class="note">${e}</span>`;
+    return e;
+  });
+  log.innerHTML = lines.length ? lines.join('\n') : 'No sessions yet.';
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  if (wizStep < 3 && !$('tab-setup').classList.contains('hidden')) wizRender();
+}
+
+async function poll() {
+  try { render(await call('/api/status', { method: 'GET' })); } catch (e) { $('statename').textContent = 'Disconnected'; }
+}
+setInterval(poll, 2000); poll();
+
+async function action(path, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  const r = await call(path);
+  showMsg($('msg'), r.message || (r.ok ? 'Done.' : 'Failed.'), r.ok === false);
+  poll();
+}
+$('btnStart').onclick = () => action('/api/start');
+$('btnStop').onclick = () => action('/api/stop', 'Stop the session and restore your display and Meta settings?\n\nQuit VRChat first if it is still open.');
+$('btnRecover').onclick = () => action('/api/recover', 'Run recovery now?\n\nMake sure the Rift S is plugged in, and VRChat and SteamVR are closed.');
+$('btnDebug').onclick = () => action('/api/debug-tool');
+$('btnFolder').onclick = () => call('/api/open-folder?which=session');
+
+// ---------- setup wizard ----------
+let wizStep = 0, wizResult = null;
+const WIZ = [
+  ['Record your headset', `<p>This finds your Rift S by comparing your devices with the headset plugged in, unplugged, and plugged back in. Nothing is changed until you press Save.</p>
+     <p><b>Before you start:</b> make sure no VR session is running, the <b>Meta Horizon app is open</b> and the headset is plugged in (USB and DisplayPort) with its light on.</p>`, 'Headset is plugged in → Next'],
+  ['Unplug the headset', `<p>Unplug the Rift S completely (both <b>USB</b> and <b>DisplayPort</b>). Wait about 5 seconds.</p>`, 'Headset is unplugged → Next'],
+  ['Plug it back in', `<p>Plug the Rift S back in (USB and DisplayPort). Wait until the headset light is on and Windows has finished setting it up, about 15 seconds.</p>`, 'Headset is plugged back in → Next'],
+];
+function wizRender() {
+  [1, 2, 3, 4].forEach(i => $('st' + i).className = 'step' + (i - 1 < wizStep ? ' done' : (i - 1 === wizStep ? ' cur' : '')));
+  $('wizRestart').classList.toggle('hidden', wizStep === 0);
+  if (wizStep < 3) {
+    const [t, body, btn] = WIZ[wizStep];
+    $('wizBody').innerHTML = `<div class="big">${t}</div>${body}`;
+    $('wizNext').textContent = btn; $('wizNext').classList.remove('hidden');
+    if (st && st.state !== 'idle') { $('wizNext').disabled = true; showMsg($('wizMsg'), 'Stop the VR session before running Setup.', true); }
+    else { $('wizNext').disabled = false; if ($('wizMsg').textContent.startsWith('Stop the VR')) $('wizMsg').className = 'msg'; }
+    return;
+  }
+  const r = wizResult, id = r.identity || {};
+  const warn = (r.warnings || []).map(w => `<div class="banner warn show">${w}</div>`).join('');
+  const c = r.compatible || {};
+  const comp = !c.ok
+    ? `<div class="banner bad show"><b>Not supported:</b> ${(c.issues || []).join(' · ')}.</div>`
+    : c.tested
+      ? `<div class="banner show" style="background:rgba(60,207,145,.1);border:1px solid rgba(60,207,145,.4)"><b>Supported.</b> Headset found, and this GPU has been tested.</div>`
+      : `<div class="banner warn show"><b>Headset found, GPU untested.</b> ${(c.warnings || []).join(' · ')}.</div>`;
+  const devs = (r.devices || []).map(d => `<tr><td>${d.Class || ''}</td><td>${d.FriendlyName || ''}</td><td><code>${d.InstanceId}</code></td></tr>`).join('');
+  const g = (r.gpus || []).map(x => `${x.Name} (driver ${x.DriverVersion})`).join('<br>');
+  $('wizBody').innerHTML = `<div class="big">Result</div>${warn}${id.monitorInstance ? comp : ''}
+    <table><tr><th style="width:170px">Headset display</th><td><code>${id.monitorInstance || '—'}</code></td></tr>
+      <tr><th>Display target ID</th><td>${id.targetId || '—'}</td></tr>
+      <tr><th>Headset</th><td>${id.headsetModel || '—'}</td></tr>
+      <tr><th>Headset serial</th><td>${id.headsetSerial ? '<code>' + id.headsetSerial + '</code> <span style="color:var(--muted)">(from ' + id.serialSource + ')</span>' : '—'}</td></tr>
+      <tr><th>Graphics</th><td>${g || '—'}</td></tr></table>
+    <h2 style="margin-top:16px">Devices that disappeared and came back</h2>
+    <table><tr><th>Class</th><th>Name</th><th>Instance ID</th></tr>${devs || '<tr><td colspan=3>None</td></tr>'}</table>`;
+  $('wizNext').textContent = 'Save';
+  $('wizNext').classList.toggle('hidden', !id.monitorInstance);
+}
+$('wizNext').onclick = async () => {
+  if (wizStep === 3) {
+    const id = wizResult.identity;
+    const r = await call('/api/setup/save', { body: JSON.stringify({ monitorInstance: id.monitorInstance, targetId: id.targetId, gpuName: id.gpuName, gpuPnpMatch: id.gpuPnpMatch, headsetModel: id.headsetModel, headsetSerial: id.headsetSerial }) });
+    showMsg($('wizMsg'), r.message || 'Saved.', r.ok === false); poll(); return;
+  }
+  $('wizNext').disabled = true;
+  $('wizMsg').className = 'msg show'; $('wizMsg').innerHTML = '<span class="spinner"></span>Reading devices…';
+  const r = await call('/api/setup/step?n=' + (wizStep + 1));
+  $('wizNext').disabled = false;
+  if (r.ok === false) { showMsg($('wizMsg'), r.message, true); return; }
+  showMsg($('wizMsg'), `Recorded ${r.count} devices.`);
+  if (r.result) wizResult = r.result;
+  wizStep++; wizRender();
+};
+$('wizRestart').onclick = () => { wizStep = 0; wizResult = null; $('wizMsg').className = 'msg'; wizRender(); };
+wizRender();
+</script>
+</body>
+</html>
