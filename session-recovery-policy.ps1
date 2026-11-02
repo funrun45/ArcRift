@@ -11,7 +11,9 @@ function Assert-ArcRiftRecoveryScope($Registry,$Plugins,$Edid) {
         'HKLM:\SOFTWARE\Oculus|ForceGPUDriverVersionAcceptance',
         'HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus\Config|PreventDashLaunch'
     )
-    if (@($Registry).Count -ne 3 -or @($Plugins).Count -ne 3) { throw 'Recovery backup count mismatch.' }
+    # Release 1.1.2: a session skips streaming plugins Meta no longer installs, so 0-3 plugin backups are valid.
+    if (@($Registry).Count -ne 3 -or @($Plugins).Count -gt 3) { throw 'Recovery backup count mismatch.' }
+    $pluginFolder = Join-Path (Get-ArcRiftMetaRuntimePath) 'server-plugins'
     $seen = @{}
     foreach ($r in $Registry) {
         $key=$r.Path+'|'+$r.Name
@@ -21,7 +23,7 @@ function Assert-ArcRiftRecoveryScope($Registry,$Plugins,$Edid) {
     $seen=@{}
     foreach ($p in $Plugins) {
         $name=[IO.Path]::GetFileName($p.Original)
-        $expected='C:\Program Files\Meta Horizon\Support\oculus-runtime\server-plugins\'+$name
+        $expected=Join-Path $pluginFolder $name
         if ($name -notin @('RemoteHeadset.dll','RemoteHeadset_v55.dll','RemoteHeadsetDisco.dll') -or
             $p.Original -ne $expected -or $p.Temporary -ne ($expected+'.arc-rift-d3d11-disabled') -or
             $p.Hash -notmatch '^[a-fA-F0-9]{64}$' -or $seen.ContainsKey($name)) { throw 'Recovery plugin scope mismatch.' }

@@ -34,6 +34,7 @@
   .bigdot.running { background: var(--ok); box-shadow: 0 0 0 4px rgba(60,207,145,.18); animation: pulse 2s infinite; }
   .bigdot.starting, .bigdot.stopping { background: var(--warn); animation: pulse 1s infinite; }
   .bigdot.recovery { background: var(--bad); }
+  .bigdot.recovering { background: var(--warn); animation: pulse 1s infinite; }
   @keyframes pulse { 50% { opacity: .55; } }
   .statename { font-size: 22px; font-weight: 600; }
   .sub { color: var(--muted); min-height: 20px; }
@@ -110,6 +111,7 @@
           <button class="act" id="btnStart">Start VR session</button>
           <button class="act stop" id="btnStop">Stop &amp; restore</button>
           <button class="act recover hidden" id="btnRecover">Recover</button>
+          <button class="act ghost hidden" id="btnDismiss">Recover finished but still stuck? Clear…</button>
           <div class="row2">
             <button class="act ghost" id="btnDebug">Proximity bypass…</button>
             <button class="act ghost" id="btnFolder">Open session folder</button>
@@ -168,7 +170,8 @@
         <li>Taking the headset off pauses the freeze check; putting it back on resumes.</li>
         <li>If the headset is put down and sits still for a while, Meta's runtime can freeze when it is picked up. The session then stops and restores itself; just start a new one.</li>
         <li>Sessions stop automatically on real trouble (frame-rate collapse, GPU errors, Meta/SteamVR exiting) and restore your display and Meta settings.</li>
-        <li>If the PowerShell window was closed or crashed before cleanup finished, a red banner appears: press <b>Recover</b> with the headset plugged in.</li>
+        <li>If the PowerShell window was closed or crashed before cleanup finished, a red banner appears: press <b>Recover</b> with the headset plugged in. <b>Restoring…</b> means automatic recovery is already running: wait for it.</li>
+        <li>If Recover finished but <b>Needs recovery</b> stays (usually your monitor setup changed during the session), press <b>Clear…</b>. It changes nothing; it re-checks the Meta settings, headset display mode and plugins, then clears the warning.</li>
         <li>Each session gets a folder (<code>d3d11-…</code>) with logs and, if PresentMon.exe is present, frame timings (<code>presentmon.csv</code>).</li>
       </ul>
       <h3>Never</h3>
@@ -183,6 +186,8 @@
 <script>
 const TOKEN = location.hash.slice(1);
 const $ = id => document.getElementById(id);
+// Device and GPU names come from drivers and USB devices: always insert them as text, never as HTML.
+const esc = v => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 async function call(path, opts = {}) {
   const r = await fetch(path, { method: opts.method || 'POST', headers: { 'X-ArcRift-Token': TOKEN, 'Content-Type': 'application/json' }, body: opts.body });
   return r.json();
@@ -200,6 +205,7 @@ const STATE = {
   running:  ['Running', 'Start your SteamVR game (for example from Steam in VR mode).'],
   stopping: ['Stopping…', 'Restoring display, Meta runtime and settings. Leave the PowerShell window open.'],
   recovery: ['Needs recovery', 'Cleanup did not finish last time.'],
+  recovering: ['Restoring…', 'Automatic recovery is restoring your display and Meta settings. Keep the headset plugged in and wait.'],
 };
 let st = null;
 
@@ -217,7 +223,7 @@ function render(s) {
   $('statename').textContent = name;
   let subText = sub;
   if (s.state === 'idle' && s.lastName) {
-    const r = s.lastResult === 'restored' ? 'restored ✓' : s.lastResult === 'recovered' ? 'recovered ✓' : 'result unknown';
+    const r = s.lastResult === 'restored' ? 'restored ✓' : s.lastResult === 'recovered' ? 'recovered ✓' : s.lastResult === 'cleared' ? 'cleared by you (settings verified, display layout differed)' : 'result unknown';
     subText += `\nLast session ${r}` + (s.lastReason ? ` · ${s.lastReason}` : '');
   }
   $('statesub').textContent = subText;
@@ -228,6 +234,7 @@ function render(s) {
   $('btnStart').disabled = s.state !== 'idle' || !compatOk || missing.length > 0;
   $('btnStop').disabled = !(s.state === 'running' || s.state === 'starting');
   $('btnRecover').classList.toggle('hidden', s.state !== 'recovery');
+  $('btnDismiss').classList.toggle('hidden', s.state !== 'recovery');
   $('recoverBanner').classList.toggle('show', s.state === 'recovery');
   const cb = $('compatBanner');
   cb.className = 'banner warn';
@@ -251,10 +258,10 @@ function render(s) {
     ['Meta runtime', s.service === 'running' ? 'on' : (s.service === 'stopped' ? '' : 'warn'), 'Service ' + s.service + (p.meta ? ' · server running' : '')],
     ['SteamVR', p.steamvr && p.compositor ? 'on' : (p.steamvr || p.compositor ? 'warn' : ''), p.steamvr ? 'Running' : 'Not running'],
     ['VR game', p.game ? 'on' : '', p.game ? s.gameName : 'None running'],
-    ['Session window', p.harness ? 'on' : (s.state === 'recovery' ? 'bad' : ''), p.harness ? 'Open — do not close' : 'Closed'],
+    ['Session window', p.harness ? 'on' : (s.state === 'recovery' ? 'bad' : (s.state === 'recovering' ? 'warn' : '')), p.harness ? 'Open — do not close' : (s.state === 'recovering' ? 'Closed · recovery running' : 'Closed')],
     ['Frame recorder', p.presentmon ? 'on' : '', s.presentmonAvailable ? (p.presentmon ? 'Recording' : 'Ready') : 'Not installed'],
   ];
-  $('comps').innerHTML = comps.map(([n, c, d]) => `<div class="comp"><div class="dot ${c}"></div><div>${n}<small>${d}</small></div></div>`).join('');
+  $('comps').innerHTML = comps.map(([n, c, d]) => `<div class="comp"><div class="dot ${c}"></div><div>${n}<small>${esc(d)}</small></div></div>`).join('');
 
   const live = s.state === 'running' || s.state === 'stopping' || s.state === 'starting';
   $('sElapsed').textContent = live ? fmtElapsed(s.sessionStarted) : '–';
@@ -281,16 +288,26 @@ async function poll() {
 }
 setInterval(poll, 2000); poll();
 
-async function action(path, confirmText) {
+async function action(button, path, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
-  const r = await call(path);
-  showMsg($('msg'), r.message || (r.ok ? 'Done.' : 'Failed.'), r.ok === false);
-  poll();
+  button.disabled = true; // a second click must not send a second request
+  try {
+    const r = await call(path);
+    showMsg($('msg'), r.message || (r.ok ? 'Done.' : 'Failed.'), r.ok === false);
+  } catch (e) {
+    showMsg($('msg'), 'ArcRift Control did not answer. Close this window and open ArcRift Control again.', true);
+  } finally {
+    button.disabled = false;
+    poll(); // re-applies the state-based enable/disable
+  }
 }
-$('btnStart').onclick = () => action('/api/start');
-$('btnStop').onclick = () => action('/api/stop', 'Stop the session and restore your display and Meta settings?\n\nQuit your game first if it is still open.');
-$('btnRecover').onclick = () => action('/api/recover', 'Run recovery now?\n\nMake sure the Rift S is plugged in, and your game and SteamVR are closed.');
-$('btnDebug').onclick = () => action('/api/debug-tool');
+$('btnStart').onclick = () => action($('btnStart'), '/api/start');
+$('btnStop').onclick = () => action($('btnStop'), '/api/stop', 'Stop the session and restore your display and Meta settings?\n\nQuit your game first if it is still open.');
+$('btnRecover').onclick = () => action($('btnRecover'), '/api/recover', 'Run recovery now?\n\nMake sure the Rift S is plugged in, and your game and SteamVR are closed.');
+$('btnDismiss').onclick = () => action($('btnDismiss'), '/api/dismiss', 'Use this only after Recover has run and still shows "Needs recovery".\n\n' +
+  'It changes no settings. It re-checks that the Meta settings, headset display mode and Meta plugins are back to normal, then clears the warning. ' +
+  'Usually this happens because your monitor setup changed during the session (a monitor added, removed or turned off).\n\nCheck Windows display settings afterwards. Continue?');
+$('btnDebug').onclick = () => action($('btnDebug'), '/api/debug-tool');
 $('btnFolder').onclick = () => call('/api/open-folder?which=session');
 
 // ---------- setup wizard ----------
@@ -313,20 +330,20 @@ function wizRender() {
     return;
   }
   const r = wizResult, id = r.identity || {};
-  const warn = (r.warnings || []).map(w => `<div class="banner warn show">${w}</div>`).join('');
+  const warn = (r.warnings || []).map(w => `<div class="banner warn show">${esc(w)}</div>`).join('');
   const c = r.compatible || {};
   const comp = !c.ok
-    ? `<div class="banner bad show"><b>Not supported:</b> ${(c.issues || []).join(' · ')}.</div>`
+    ? `<div class="banner bad show"><b>Not supported:</b> ${esc((c.issues || []).join(' · '))}.</div>`
     : c.tested
       ? `<div class="banner show" style="background:rgba(60,207,145,.1);border:1px solid rgba(60,207,145,.4)"><b>Supported.</b> Headset found, and this GPU has been tested.</div>`
-      : `<div class="banner warn show"><b>Headset found, GPU untested.</b> ${(c.warnings || []).join(' · ')}.</div>`;
-  const devs = (r.devices || []).map(d => `<tr><td>${d.Class || ''}</td><td>${d.FriendlyName || ''}</td><td><code>${d.InstanceId}</code></td></tr>`).join('');
-  const g = (r.gpus || []).map(x => `${x.Name} (driver ${x.DriverVersion})`).join('<br>');
+      : `<div class="banner warn show"><b>Headset found, GPU untested.</b> ${esc((c.warnings || []).join(' · '))}.</div>`;
+  const devs = (r.devices || []).map(d => `<tr><td>${esc(d.Class)}</td><td>${esc(d.FriendlyName)}</td><td><code>${esc(d.InstanceId)}</code></td></tr>`).join('');
+  const g = (r.gpus || []).map(x => `${esc(x.Name)} (driver ${esc(x.DriverVersion)})`).join('<br>');
   $('wizBody').innerHTML = `<div class="big">Result</div>${warn}${id.monitorInstance ? comp : ''}
-    <table><tr><th style="width:170px">Headset display</th><td><code>${id.monitorInstance || '—'}</code></td></tr>
-      <tr><th>Display target ID</th><td>${id.targetId || '—'}</td></tr>
-      <tr><th>Headset</th><td>${id.headsetModel || '—'}</td></tr>
-      <tr><th>Headset serial</th><td>${id.headsetSerial ? '<code>' + id.headsetSerial + '</code> <span style="color:var(--muted)">(from ' + id.serialSource + ')</span>' : '—'}</td></tr>
+    <table><tr><th style="width:170px">Headset display</th><td><code>${esc(id.monitorInstance) || '—'}</code></td></tr>
+      <tr><th>Display target ID</th><td>${esc(id.targetId) || '—'}</td></tr>
+      <tr><th>Headset</th><td>${esc(id.headsetModel) || '—'}</td></tr>
+      <tr><th>Headset serial</th><td>${id.headsetSerial ? '<code>' + esc(id.headsetSerial) + '</code> <span style="color:var(--muted)">(from ' + esc(id.serialSource) + ')</span>' : '—'}</td></tr>
       <tr><th>Graphics</th><td>${g || '—'}</td></tr></table>
     <h2 style="margin-top:16px">Devices that disappeared and came back</h2>
     <table><tr><th>Class</th><th>Name</th><th>Instance ID</th></tr>${devs || '<tr><td colspan=3>None</td></tr>'}</table>`;

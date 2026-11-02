@@ -25,6 +25,7 @@ function Stop-ArcRiftMetaRuntime([int]$TimeoutSeconds = 20) {
     }
     if ((Get-Service OVRService).Status -ne 'Stopped') { throw 'Meta runtime service could not be stopped.' }
 }
+. (Join-Path $root 'install-paths.ps1')
 . (Join-Path $root 'session-recovery-policy.ps1')
 $full=[IO.Path]::GetFullPath($SessionDirectory).TrimEnd('\')
 if ([IO.Path]::GetDirectoryName($full) -ne $root -or [IO.Path]::GetFileName($full) -notmatch '^d3d11-\d{8}-\d{6}$') { throw 'Recovery session must be inside this package.' }
@@ -48,8 +49,9 @@ try {
     $before=@($registry | Where-Object Name -eq 'DirectDisplayDLL')[0]
     $ours=Join-Path $root 'arc_rift_bridge.dll'
     if ($current -and $current -ne $ours -and (-not $before.Had -or $current -ne $before.Value)) { throw 'Another display backend is configured; refusing ambiguous recovery.' }
-    $steamRoot='C:\Program Files (x86)\Steam\steamapps\common\SteamVR'
-    $vr=@(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($steamRoot+'\',[StringComparison]::OrdinalIgnoreCase) })
+    # No SteamVR install found means no SteamVR processes to close.
+    $steamRoot=try { Get-ArcRiftSteamVRPath (Get-ArcRiftSteamPath) } catch { $null }
+    $vr=@(if ($steamRoot) { Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($steamRoot+'\',[StringComparison]::OrdinalIgnoreCase) } })
     if ($vr.Count -and $current -ne $ours) { throw 'Unowned SteamVR session present. Close it normally before recovery.' }
     $vr | Stop-Process -Force
     'Stop source helper for full recovery.' | Set-Content (Join-Path $full 'native-source-stop.txt')
@@ -88,7 +90,7 @@ try {
         $text=& (Join-Path $root 'display_probe.exe')
         $text | Out-File (Join-Path $full 'manual-recovery-display.txt')
         if ($LASTEXITCODE -ne 0) { continue }
-        $after=Get-ArcRiftRecoveryLayouts ($text -join "`n")
+        try { $after=Get-ArcRiftRecoveryLayouts ($text -join "`n") } catch { continue }
         $matched=$after.Count -eq $baseline.Count
         foreach ($id in $baseline.Keys) { if ($after[$id] -ne $baseline[$id]) { $matched=$false } }
         if ($matched) { break }

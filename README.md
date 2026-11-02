@@ -1,4 +1,4 @@
-# ArcRift 1.1.1: Oculus Rift S on Intel Arc
+# ArcRift 1.1.2: Oculus Rift S on Intel Arc
 
 by **funrun** · free and open source (MIT)
 
@@ -19,7 +19,8 @@ by Meta, Oculus, Intel or Valve.
   **Tested: Arc A770** (Intel driver 32.0.101.9150). Other Intel Arc cards (A750, A580, B580, B570 …) are
   allowed but **untested**; please report how it goes.
 - Oculus Rift S, plugged in (USB + DisplayPort)
-- The **Meta Horizon** (Oculus) PC app and **SteamVR**, installed in their normal locations
+- The **Meta Horizon** (Oculus) PC app and **SteamVR** (any Steam library folder works), with **Steam running and signed in**
+  when you start a session
 - Microsoft Edge (comes with Windows 11; used to show the app window)
 
 ## First-time setup
@@ -35,6 +36,8 @@ by Meta, Oculus, Intel or Valve.
 
 1. **Dashboard → Start VR session**, then approve the administrator prompt. A PowerShell window opens.
    **Leave it open**: it restores everything at the end. SteamVR starts automatically.
+   If the headset has gone to sleep (it sat unused), the session says so and waits: put it on, or pick it up and
+   move it, and it continues 10 s after the headset wakes.
 2. When the status says **Running**, start your SteamVR game (for example from Steam in VR mode).
 3. Optional: press **Proximity bypass…** and set *Bypass Proximity Sensor Check* to **On** (do this after Running;
    close the Debug Tool before stopping).
@@ -45,13 +48,17 @@ by Meta, Oculus, Intel or Valve.
 - **Never close the administrator PowerShell window** during a session.
 - **Never run two copies of ArcRift at the same time.**
 - If that window closed or crashed before cleanup finished, the app shows **Needs recovery**: plug in the
-  headset, close your game and SteamVR, and press **Recover**.
+  headset, close your game and SteamVR, and press **Recover**. (If it shows **Restoring…**, automatic recovery is
+  already running: just wait.)
+- If Recover finished but **Needs recovery** stays (usually because your monitor setup changed during the session),
+  press **Clear…**. It changes nothing; it re-checks that the Meta settings, headset display mode and plugins are
+  restored, then clears the warning. Check Windows display settings afterwards.
 - If you see lag, smearing or garbled pixels, take the headset off and press **Stop & restore** right away.
 
 ## What a session does by itself
 
 - Stops and restores everything on real trouble: the headset frame rate dropping below 45 fps twice in a row,
-  no frames for 3 s, the GPU device being lost or hung, sustained SteamVR sync errors (more than 20 in 30 s),
+  no frames for 3 s, the GPU device being lost or hung, sustained SteamVR sync errors (more than 20 in 30 s, nonstop for 2 minutes),
   Meta or SteamVR exiting, a Windows display-driver reset, or low disk space.
 - Pauses the freeze check while the headset is off, and resumes it when you put it back on.
 - If Meta's runtime stops responding for 30 s, restores everything automatically.
@@ -59,6 +66,10 @@ by Meta, Oculus, Intel or Valve.
   to turn this off.
 
 ## Known issues
+
+- **First start after the headset sat unused:** Meta looks for the headset display only once, when its runtime
+  starts, and a sleeping headset has none. Since 1.1.2 the session waits for the headset to wake first, and if Meta
+  still misses the display it wakes the headset with Meta's normal runtime and retries once.
 
 - **Putting the headset down for a while:** after about 20 s without movement, Meta pauses tracking, and picking
   the headset up again can freeze Meta's runtime. ArcRift notices and restores; just start a new session.

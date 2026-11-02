@@ -37,11 +37,13 @@ try {
     $launchDeadline = (Get-Date).AddSeconds(6)
     $cancel = Join-Path $EvidenceDirectory 'user-worker-cancel.txt'
     if (Test-Path -LiteralPath $cancel) { throw 'Launch was cancelled.' }
-    $bin = 'C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64'
+    . (Join-Path $PSScriptRoot 'install-paths.ps1')
+    $steamPath = Get-ArcRiftSteamPath
+    $bin = Join-Path (Get-ArcRiftSteamVRPath $steamPath) 'bin\win64'
     $bootState = @{}
     if ($WaitForCompositor) {
         . (Join-Path $PSScriptRoot 'steamvr-startup-policy.ps1')
-        $graphicsLog = 'C:\Program Files (x86)\Steam\logs\vrcompositor.txt'
+        $graphicsLog = Join-Path $steamPath 'logs\vrcompositor.txt'
         $backendLog = Join-Path $PSScriptRoot 'arc-rift-bridge.log'
         [long]$graphicsOffset = 0
         [long]$backendOffset = 0

@@ -31,9 +31,11 @@ function Read-ArcRiftStartupLog {
 }
 
 # vrstartup is a short-lived bootstrapper, NOT the pinned server/compositor.
+# Any participant that exited before its token could be read (e.g. Steam restarting itself) is skipped;
+# its replacement gets a new PID and is checked on its own. Server/compositor/diagnostic exits have their own guards.
 function Get-ArcRiftParticipantTokenDecision {
     param([string]$Name, [int]$Integrity, [bool]$ConfirmedExited)
     if ($Integrity -eq 8192) { return 'VerifiedMedium' }
-    if ($Name -eq 'vrstartup' -and $Integrity -lt 0 -and $ConfirmedExited) { return 'ExitedLauncher' }
+    if ($Integrity -lt 0 -and $ConfirmedExited) { return 'ExitedLauncher' }
     throw ('Unexpected participant token: ' + $Name + ' RID=' + $Integrity)
 }

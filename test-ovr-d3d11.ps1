@@ -15,8 +15,11 @@ $changed = $false
 $client = $null
 $sourceHelper = $null
 $steamStarted = $false
-$steamRoot = 'C:\Program Files (x86)\Steam\steamapps\common\SteamVR'
-$steamBin = Join-Path $steamRoot 'bin\win64'
+# Release 1.1.2: install folders are looked up (install-paths.ps1) during the identity checks below.
+$steamPath = $null
+$steamRoot = $null
+$steamBin = $null
+$metaRuntime = $null
 $start = Get-Date
 $failed = $false
 $edidChanged = $false
@@ -35,6 +38,7 @@ $guardedTrial = $shortHeadsetTrial -or $guardedSteamTrial
 [long]$steamGraphicsOffset = 0
 $steamGraphicsTail = ''
 $syncHiccupTimes = New-Object System.Collections.Generic.List[datetime]
+$syncFloodSince = $null
 $bridgeFpsPrevTick = $null
 $bridgeFpsPrevFrame = $null
 $bridgeLowFpsCount = 0
@@ -45,7 +49,11 @@ $metaLogPath = $null
 $metaLogCheckAt = Get-Date
 $metaLastGrowth = Get-Date
 $presentMonProcess = $null
-$steamGraphicsLog = 'C:\Program Files (x86)\Steam\logs\vrcompositor.txt'
+$steamGraphicsLog = $null
+$presentMonGames = @('VRChat.exe')
+$presentMonFiles = 0
+$nextGameCheck = Get-Date
+[long]$vrserverLogOffset = 0
 $verifiedParticipantIds = @{}
 $script:ArcRiftSteamWorkerProcess = $null
 $startupSeed = Join-Path $root 'arc_rift_bridge_startup.dll.identity'
@@ -88,6 +96,14 @@ try {
     $edidSum = 0; for ($i = 0; $i -lt 127; $i++) { $edidSum += $edidBytes[$i] }
     $edidBytes[127] = [byte]((256 - ($edidSum % 256)) % 256)
     [IO.File]::WriteAllBytes((Join-Path $root 'rift-s-native-test.edid'), $edidBytes)
+    . (Join-Path $root 'install-paths.ps1')
+    $metaRuntime = Get-ArcRiftMetaRuntimePath
+    if ($SteamVR) {
+        $steamPath = Get-ArcRiftSteamPath
+        $steamRoot = Get-ArcRiftSteamVRPath $steamPath
+        $steamBin = Join-Path $steamRoot 'bin\win64'
+        $steamGraphicsLog = Join-Path $steamPath 'logs\vrcompositor.txt'
+    }
 } catch { $arcConfigError = $_.Exception.Message }
 $monitorParent = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + $monitorInstance + '\Device Parameters'
 $edidKey = $monitorParent + '\EDID_OVERRIDE'
@@ -112,6 +128,112 @@ function Stop-ArcRiftMetaRuntime([int]$TimeoutSeconds = 20) {
         while ((Get-Service OVRService).Status -ne 'Stopped' -and (Get-Date) -lt $svcDeadline) { Start-Sleep -Milliseconds 500 }
     }
     if ((Get-Service OVRService).Status -ne 'Stopped') { throw 'Meta runtime service could not be stopped.' }
+}
+function Get-ArcRiftHeadsetWake([datetime]$NotBefore = [datetime]::MinValue) {
+    # From Meta's newest log: is the headset awake, and since when? 'HMD unavailable' means it went to sleep after
+    # sitting unused; proximity 0 -> 1 or 'HMD mounted' after that means it woke. No log at all counts as Unknown.
+    $log = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Oculus') -Filter 'Service_*.txt' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+    if (-not $log) { return [pscustomobject]@{State='Unknown'; Since=[datetime]::MinValue} }
+    [long]$fromStart = 0
+    $text = Read-AppendedBridgeLog $log.FullName ([ref]$fromStart)
+    $started = $null; $asleep = $null; $woke = $null
+    $pattern = '(?m)^(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3}) [^\r\n]*?(Starting Oculus Runtime Service|Broadcasting HMD unavailable event|Proximity state changed \(0 -> 1\)|Broadcasting HMD mounted event)'
+    foreach ($m in [regex]::Matches($text, $pattern)) {
+        $g = $m.Groups
+        # Meta writes day/month, e.g. "02/11 11:06:25.841" for 2 November.
+        $t = [datetime]::new((Get-Date).Year, [int]$g[2].Value, [int]$g[1].Value, [int]$g[3].Value, [int]$g[4].Value, [int]$g[5].Value, [int]$g[6].Value)
+        if ($t -gt (Get-Date).AddDays(1)) { $t = $t.AddYears(-1) }
+        if ($g[7].Value -like 'Starting*') { $started = $t; $asleep = $null; $woke = $null }
+        elseif ($g[7].Value -like '*unavailable*') { $asleep = $t; $woke = $null }
+        elseif ($asleep -and -not $woke) { $woke = $t }
+    }
+    # NotBefore: when waiting for a runtime we just started, its log must be the newest one (allow 2 s clock slack).
+    if (-not $started -or ($NotBefore -gt [datetime]::MinValue -and $started -lt $NotBefore.AddSeconds(-2))) { return [pscustomobject]@{State='Starting'; Since=[datetime]::MinValue} }
+    if ($asleep -and -not $woke) { return [pscustomobject]@{State='Asleep'; Since=$asleep} }
+    # Meta briefly reports 'unavailable' ~8-10 s after every start, so a runtime with no wake event yet needs 15 s.
+    if ($woke) { return [pscustomobject]@{State='Awake'; Since=$woke; Settle=10} }
+    return [pscustomobject]@{State='Awake'; Since=$started; Settle=15}
+}
+function Wait-ArcRiftHeadsetAwake([datetime]$NotBefore = [datetime]::MinValue, [int]$TimeoutSeconds = 180) {
+    # Release 1.1.2: Meta looks for the headset display only once, when its runtime starts. A headset that is asleep
+    # (sat unused) or still waking up has no display at that moment, so wait until it has been awake for 10 s.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $told = ''
+    while ($true) {
+        $wake = Get-ArcRiftHeadsetWake $NotBefore
+        if ($wake.State -eq 'Unknown') { return }
+        if ($wake.State -eq 'Awake' -and ((Get-Date) - $wake.Since).TotalSeconds -ge $wake.Settle) {
+            if ($told) { Write-Output 'Headset is awake.' }
+            return
+        }
+        $message = switch ($wake.State) {
+            'Asleep' { 'Headset is asleep: put it on, or pick it up and move it, to wake it. The session continues 10 s after it wakes.' }
+            'Awake' { 'Headset is waking up; continuing in a few seconds...' }
+            default { 'Waiting for the Meta runtime to start...' }
+        }
+        if ($message -ne $told) { Write-Output $message; $told = $message }
+        if (Test-Path -LiteralPath (Join-Path $out 'session-stop.txt')) { throw 'Stopped by you while waiting for the headset to wake.' }
+        if ((Get-Date) -gt $deadline) { throw 'The headset did not wake up within 3 minutes. Put it on until its display lights up, then start the session again.' }
+        Start-Sleep -Seconds 1
+    }
+}
+$clientLogFreedTo = 1MB
+$clientLogFreeWarned = $false
+function Limit-ArcRiftClientLog([string]$Path) {
+    # Release 1.1.2: vrcmd --pollposes writes ~40 MB/hour of poses to client.txt. Free the disk space of everything
+    # except its first 1 MB and last 8 MB (sparse zeroing; vrcmd keeps writing normally). Never fails the session.
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        $length = (Get-Item -LiteralPath $Path).Length
+        $freeTo = [long]([math]::Floor(($length - 8MB) / 65536) * 65536)
+        if ($freeTo - $script:clientLogFreedTo -lt 64MB) { return }
+        if (-not ('ArcRiftSparseLog' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System; using System.IO; using System.ComponentModel; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class ArcRiftSparseLog {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool DeviceIoControl(SafeFileHandle handle, uint code, IntPtr input, int inputSize, IntPtr output, int outputSize, out int returned, IntPtr overlapped);
+    public static void ZeroRange(string path, long from, long to) {
+        using (var file = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) {
+            int returned;
+            // FSCTL_SET_SPARSE, then FSCTL_SET_ZERO_DATA: the zeroed range stops using disk space.
+            if (!DeviceIoControl(file.SafeFileHandle, 0x000900C4, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero)) throw new Win32Exception();
+            IntPtr range = Marshal.AllocHGlobal(16);
+            try {
+                Marshal.WriteInt64(range, 0, from); Marshal.WriteInt64(range, 8, to);
+                if (!DeviceIoControl(file.SafeFileHandle, 0x000980C8, range, 16, IntPtr.Zero, 0, out returned, IntPtr.Zero)) throw new Win32Exception();
+            } finally { Marshal.FreeHGlobal(range); }
+        }
+    }
+}
+'@
+        }
+        [ArcRiftSparseLog]::ZeroRange($Path, $script:clientLogFreedTo, $freeTo)
+        $script:clientLogFreedTo = $freeTo
+    } catch {
+        if (-not $script:clientLogFreeWarned) { $script:clientLogFreeWarned = $true; Write-Output ('client.txt disk space could not be freed (session unaffected): ' + $_.Exception.Message) }
+    }
+}
+function Stop-ArcRiftPresentMon {
+    if (-not $script:presentMonProcess) { return }
+    try {
+        $pmStop = Start-Process -FilePath (Join-Path $root 'PresentMon.exe') -ArgumentList '--session_name ArcRiftPM --terminate_existing_session' -WindowStyle Hidden -PassThru
+        $null = $pmStop.WaitForExit(5000)
+        if (-not $script:presentMonProcess.WaitForExit(5000)) { Stop-Process -Id $script:presentMonProcess.Id -Force -ErrorAction SilentlyContinue }
+    } catch { Write-Output ('PresentMon stop note (rollback unaffected): ' + $_.Exception.Message) }
+    $script:presentMonProcess = $null
+}
+function Start-ArcRiftPresentMon {
+    # Optional read-only frame-timing capture for Meta's server and every game seen so far. Never affects the session.
+    try {
+        Stop-ArcRiftPresentMon
+        $script:presentMonFiles++
+        $csv = if ($script:presentMonFiles -eq 1) { 'presentmon.csv' } else { 'presentmon-' + $script:presentMonFiles + '.csv' }
+        $names = (@($script:presentMonGames) + 'OVRServer_x64.exe' | ForEach-Object { '--process_name "' + $_ + '"' }) -join ' '
+        $pmArgs = $names + ' --output_file "' + (Join-Path $out $csv) + '" --no_console_stats --no_track_input --session_name ArcRiftPM --stop_existing_session'
+        $script:presentMonProcess = Start-Process -FilePath (Join-Path $root 'PresentMon.exe') -ArgumentList $pmArgs -WindowStyle Hidden -PassThru
+        Write-Output ('Frame-timing recorder (PresentMon) started: ' + $csv + ' in this session folder (' + ($script:presentMonGames -join ', ') + ').')
+    } catch { Write-Output ('PresentMon not started (session unaffected): ' + $_.Exception.Message) }
 }
 function Read-AppendedBridgeLog([string]$Path, [ref]$Offset) {
     $stream = $null
@@ -219,6 +341,8 @@ try {
         New-Item -ItemType Directory -Path $preflight | Out-Null
         $workerProof = Start-ArcRiftSteamWorker -EvidenceDirectory $preflight -ProbeOnly
         if ($workerProof.Integrity -ne 8192) { throw 'Normal-user worker preflight failed.' }
+        if (-not (Get-Process steam -ErrorAction SilentlyContinue)) { throw 'Steam is not running. Start Steam and sign in, then start the session again; no changes made.' }
+        if (-not (Get-Process OVRServer_x64 -ErrorAction SilentlyContinue)) { throw 'Meta runtime is not running. Open the Meta Horizon app with the headset plugged in, then start the session again; no changes made.' }
         foreach ($p in @(Get-Process OVRServer_x64,steam,explorer -ErrorAction Stop)) {
             if ([ArcRiftIntegrityProbe]::Integrity($p.Id) -ne 8192) { throw ('Participant is not Medium integrity: ' + $p.Name) }
         }
@@ -232,13 +356,15 @@ try {
     if ((Get-Service OVRService).Status -ne 'Running') { throw 'Service is not in the expected original running state.' }
     if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash is already running; refusing to interrupt an existing session.' }
     if (Test-Path -LiteralPath $edidKey) { throw 'EDID experiment already active.' }
+    # Release 1.1.2: never back up "original" settings over a session that was not restored yet.
+    if (Test-Path -LiteralPath $activeSession) { throw 'The previous session was not restored (active-test.xml exists). Run Recover in ArcRift Control or RECOVER.cmd first; no changes made.' }
     $sessionLock = [IO.File]::Open($sessionLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     [pscustomobject]@{SessionDirectory=$out; HarnessPid=$PID; Started=(Get-Date)} | Export-Clixml $activeSession
     if ($SteamVR) {
         if (-not (Test-Path (Join-Path $steamBin 'vrcmd.exe'))) { throw 'Installed SteamVR diagnostic is missing.' }
         $existing = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($steamRoot + '\', [StringComparison]::OrdinalIgnoreCase) })
         if ($existing.Count -or (Get-Process vrserver,vrcompositor,vrmonitor -ErrorAction SilentlyContinue)) { throw 'SteamVR already running; refusing to interrupt an existing session.' }
-        $steamConfig = 'C:\Program Files (x86)\Steam\config\steamvr.vrsettings'
+        $steamConfig = Join-Path $steamPath 'config\steamvr.vrsettings'
         if (Test-Path $steamConfig) { Copy-Item -LiteralPath $steamConfig -Destination (Join-Path $out 'steamvr-settings-before.json') }
     }
     & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-baseline.txt')
@@ -271,7 +397,13 @@ try {
     }
     if ($LASTEXITCODE -ne 0) { throw 'Bridge preflight failed.' }
     Get-FileHash -LiteralPath (Join-Path $root $bridgeName) -Algorithm SHA256 | Export-Clixml (Join-Path $out 'backend-hash.xml')
-    if (Test-Path (Join-Path $root $bridgeLogName)) { $bridgeLogOffset = (Get-Item (Join-Path $root $bridgeLogName)).Length }
+    # Release 1.1.2: the bridge appends to one log forever; start a fresh one once it passes 8 MB (bridge is not loaded yet).
+    $bridgeLogPath = Join-Path $root $bridgeLogName
+    if ((Test-Path -LiteralPath $bridgeLogPath) -and (Get-Item -LiteralPath $bridgeLogPath).Length -gt 8MB) {
+        try { Move-Item -LiteralPath $bridgeLogPath -Destination ($bridgeLogPath -replace '\.log$', '.old.log') -Force } catch { Write-Output ('Bridge log not rotated: ' + $_.Exception.Message) }
+    }
+    if (Test-Path $bridgeLogPath) { $bridgeLogOffset = (Get-Item $bridgeLogPath).Length }
+    [long]$bridgeLogSessionStart = $bridgeLogOffset
     $settings = @(
         @{Path='HKLM:\SOFTWARE\Oculus'; Name='DirectDisplayDLL'; Value=(Join-Path $root $bridgeName); Kind='String'},
         @{Path='HKLM:\SOFTWARE\Oculus'; Name='ForceGPUDriverVersionAcceptance'; Value=1; Kind='DWord'},
@@ -291,9 +423,14 @@ try {
     }
     $registry | Export-Clixml (Join-Path $out 'registry-backup.xml')
     foreach ($name in @('RemoteHeadset.dll','RemoteHeadset_v55.dll','RemoteHeadsetDisco.dll')) {
-        $original = Join-Path 'C:\Program Files\Meta Horizon\Support\oculus-runtime\server-plugins' $name
+        $original = Join-Path (Join-Path $metaRuntime 'server-plugins') $name
         $temporary = $original + '.arc-rift-d3d11-disabled'
         if (Test-Path -LiteralPath $temporary) { throw 'Existing temporary plugin file.' }
+        if (-not (Test-Path -LiteralPath $original)) {
+            # A Meta update can drop or rename a streaming plugin; nothing to disable then.
+            Write-Output ('Meta streaming plugin ' + $name + ' is not installed (Meta update?); nothing to disable for it.')
+            continue
+        }
         $moves += [pscustomobject]@{Original=$original; Temporary=$temporary; Hash=(Get-FileHash -LiteralPath $original -Algorithm SHA256).Hash}
     }
     $moves | Export-Clixml (Join-Path $out 'plugins-backup.xml')
@@ -316,6 +453,8 @@ try {
             Start-Sleep -Milliseconds 100
         }
     }
+    # Release 1.1.2: the usual "first start fails" cause was a headset that had gone to sleep before the session.
+    Wait-ArcRiftHeadsetAwake
     $changed = $true
     Stop-ArcRiftMetaRuntime
     foreach ($s in $settings) {
@@ -329,8 +468,8 @@ try {
         Disable-PnpDevice -InstanceId $v.InstanceId -Confirm:$false
     }
     $start = Get-Date
-    # Release 1.1.1: Meta looks for displays only once, right when its runtime starts. If the headset was still
-    # waking up at that moment, restart the runtime once (nothing else has been applied to the displays yet).
+    # Release 1.1.1: Meta looks for displays only once, right when its runtime starts. If the headset display was not
+    # there at that moment, retry once (nothing else has been applied to the displays yet).
     for ($metaAttempt = 1; $metaAttempt -le 2; $metaAttempt++) {
         Start-Service OVRService
         $serverId = $null
@@ -358,9 +497,19 @@ try {
         }
         if ($bootLog -match ('Enumerate verified target ' + $targetId + '\b')) { break }
         if ($metaAttempt -eq 1) {
-            Write-Output 'Headset display was not ready when Meta started (headset still waking up). Restarting the Meta runtime once...'
+            # Release 1.1.2: restarting the bridge runtime alone never brought the display back (it cannot wake the
+            # headset). Wake it with Meta's normal runtime first, then switch to the bridge again right away.
+            Write-Output 'Meta did not find the headset display (headset asleep or still waking up). Waking it with the normal Meta runtime, then retrying once...'
             Stop-ArcRiftMetaRuntime
-            Start-Sleep -Seconds 3
+            $originalBackend = $registry | Where-Object Name -eq 'DirectDisplayDLL'
+            if ($originalBackend.Had) { New-ItemProperty $originalBackend.Path -Name 'DirectDisplayDLL' -Value $originalBackend.Value -PropertyType $originalBackend.Kind -Force | Out-Null }
+            else { Remove-ItemProperty $originalBackend.Path -Name 'DirectDisplayDLL' -ErrorAction SilentlyContinue }
+            $normalStart = Get-Date
+            Start-Service OVRService
+            Wait-ArcRiftHeadsetAwake $normalStart
+            Stop-ArcRiftMetaRuntime
+            $bridgeSetting = $settings | Where-Object Name -eq 'DirectDisplayDLL'
+            New-ItemProperty $bridgeSetting.Path -Name $bridgeSetting.Name -Value $bridgeSetting.Value -PropertyType $bridgeSetting.Kind -Force | Out-Null
             continue
         }
         throw 'Selected backend did not enumerate verified display during runtime startup; refusing timing/render changes.'
@@ -488,19 +637,24 @@ try {
         [pscustomobject]@{Seconds=$(if ($ManualSession) {0} else {$limit}); ManualSession=[bool]$ManualSession; Started=(Get-Date).ToString('o'); Deadline=$(if ($ManualSession) {$null} else {$deadline.ToString('o')}); HarnessPid=$PID; GameLaunchedByHarness=$false} |
             ConvertTo-Json | Set-Content (Join-Path $out 'vrchat-trial-timing.json')
     }
-    if ($SteamVR) { Write-Output ('SteamVR stop policy: ' + $cutoffLabel + '. Run this folder stop-arc-rift.cmd for full rollback; do not close this PowerShell window.') }
+    if ($SteamVR) { Write-Output ('SteamVR stop policy: ' + $cutoffLabel + '. Use Stop & restore in ArcRift Control (or STOP AND RESTORE.cmd) for full rollback; do not close this PowerShell window.') }
     $steamServerId = $bootstrapServerId
     $steamCompositorId = $bootstrapCompositorId
     $steamReady = $false
     $observationStart = Get-Date
     $candidateLastHealth = Get-Date
     $nextEventCheck = Get-Date
+    $nextPresenceCheck = Get-Date
     while ($SteamVR -or -not $client.HasExited) {
+        # Release 1.1.2: process-presence and token checks once per second, not every loop pass (each listing costs ~12 ms CPU).
+        $presenceCheck = (Get-Date) -ge $nextPresenceCheck
+        if ($presenceCheck) { $nextPresenceCheck = (Get-Date).AddSeconds(1) }
         if (Test-Path (Join-Path $out 'session-stop.txt')) { $userStopRequested = $true; Write-Output 'User requested early stop; performing full rollback.'; break }
         if ($ManualSession -and $recoveryWatcher.HasExited) { throw 'Independent manual-session recovery watcher exited; stopping session.' }
         if ($ManualSession -and (Get-Date) -ge $manualDiskCheckAt) {
             $drive=New-Object IO.DriveInfo([IO.Path]::GetPathRoot($root))
             if ($drive.AvailableFreeSpace -lt 1GB) { throw 'Low disk space: stopping manual session before diagnostic logs fill the drive.' }
+            Limit-ArcRiftClientLog (Join-Path $out 'client.txt')
             $manualDiskCheckAt=(Get-Date).AddSeconds(30)
         }
         if ($VRChatTrial) {
@@ -511,7 +665,7 @@ try {
                 ('At ' + (Get-Date).ToString('o') + ': ' + $warning + ' seconds or less remain; exit VRChat.') | Add-Content (Join-Path $out 'vrchat-countdown.txt')
             }
             # Process presence only: no game handles, token probing, memory reads or injection.
-            foreach ($game in @(Get-Process VRChat -ErrorAction SilentlyContinue)) {
+            foreach ($game in @(if ($presenceCheck) { Get-Process VRChat -ErrorAction SilentlyContinue })) {
                 if (-not $vrchatObservedPids.ContainsKey($game.Id)) {
                     $vrchatObservedPids[$game.Id] = $true
                     ('Observed VRChat PID=' + $game.Id + ' at ' + (Get-Date).ToString('o') + '; presence does not prove successful VR rendering.') | Add-Content (Join-Path $out 'vrchat-process-observations.txt')
@@ -520,12 +674,12 @@ try {
             }
         }
         if ($UserLaunchSteamTrial) {
-            foreach ($p in @(Get-Process OVRServer_x64,steam,explorer,vrstartup,vrmonitor,vrserver,vrcompositor,vrcmd -ErrorAction SilentlyContinue)) {
+            foreach ($p in @(if ($presenceCheck) { Get-Process OVRServer_x64,steam,explorer,vrstartup,vrmonitor,vrserver,vrcompositor,vrcmd -ErrorAction SilentlyContinue })) {
                 if (-not $verifiedParticipantIds.ContainsKey($p.Id)) {
                     $rid = [ArcRiftIntegrityProbe]::Integrity($p.Id)
                     ($p.Name + ' PID=' + $p.Id + ' IntegrityRID=' + $rid) | Add-Content (Join-Path $out 'live-participant-integrity.txt')
                     $confirmedExited = $false
-                    if ($rid -lt 0 -and $p.Name -eq 'vrstartup') {
+                    if ($rid -lt 0) {
                         $freshLauncher = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
                         if (-not $freshLauncher) { $confirmedExited = $true }
                         else {
@@ -534,7 +688,7 @@ try {
                     }
                     $tokenDecision = Get-ArcRiftParticipantTokenDecision $p.Name $rid $confirmedExited
                     if ($tokenDecision -eq 'ExitedLauncher') {
-                        ('Confirmed normal bootstrapper exit PID=' + $p.Id + '; server/compositor/diagnostic guards remain active.') | Add-Content (Join-Path $out 'live-participant-integrity.txt')
+                        ('Confirmed ' + $p.Name + ' exit PID=' + $p.Id + ' before token check; server/compositor/diagnostic guards remain active.') | Add-Content (Join-Path $out 'live-participant-integrity.txt')
                         continue
                     }
                     $verifiedParticipantIds[$p.Id] = $true
@@ -620,6 +774,11 @@ try {
                         if ($syncLine -match '(?i:DXGI_ERROR_DEVICE_REMOVED|DXGI_ERROR_DEVICE_HUNG)') { throw 'SteamVR reported GPU device removed/hung; aborting.' }
                         if ($syncLine -match '(?i:AcquireSync FAILED|ReleaseSync FAILED|WaitForAcquire timed out)') {
                             $syncNow = Get-Date
+                            while ($syncHiccupTimes.Count -and ($syncNow - $syncHiccupTimes[0]).TotalSeconds -gt 30) { $syncHiccupTimes.RemoveAt(0) }
+                            if ($syncFloodSince -and $syncHiccupTimes.Count -le 20) {
+                                $syncFloodSince = $null
+                                Write-Output 'SteamVR sync errors back to normal.'
+                            }
                             if ($syncLine -match '(?i:AcquireSync FAILED)') {
                                 # one AcquireSync line per hitch, plus any SteamVR hid with [N messages suppressed]
                                 $syncAdd = 1
@@ -628,7 +787,16 @@ try {
                             }
                             while ($syncHiccupTimes.Count -and ($syncNow - $syncHiccupTimes[0]).TotalSeconds -gt 30) { $syncHiccupTimes.RemoveAt(0) }
                             ('At ' + $syncNow.ToString('o') + ' (' + $syncHiccupTimes.Count + ' hitches in last 30s): ' + $syncLine.Trim()) | Add-Content (Join-Path $out 'sync-hiccups.txt')
-                            if ($syncHiccupTimes.Count -gt 20) { throw 'Sustained SteamVR sync hitches (more than 20 in 30s); aborting rather than waiting through corruption.' }
+                            # A slow game (e.g. VRChat CPU-bound in a busy world) floods these too; the headset frame-rate,
+                            # stall and device-loss guards cover real presentation trouble, so only stop on a long flood.
+                            if ($syncHiccupTimes.Count -gt 20) {
+                                if (-not $syncFloodSince) {
+                                    $syncFloodSince = $syncNow
+                                    Write-Output 'SteamVR sync errors high (game running slowly). Session continues; it stops if this lasts 2 minutes. Lower game settings if you can.'
+                                } elseif (($syncNow - $syncFloodSince).TotalSeconds -gt 120) {
+                                    throw 'Sustained SteamVR sync hitches (more than 20 in 30s for 2 minutes); aborting rather than waiting through corruption.'
+                                }
+                            }
                             if ($syncLine -match '(?i:AcquireSync FAILED)' -and $syncLine -match '(?i:OMITTING additional logs)') { Write-Output 'SteamVR sync burst (SteamVR hid further warnings for 30s). Headset frame-rate and stall guards still active.' }
                         }
                     }
@@ -649,12 +817,14 @@ try {
             if ($SteamVR) { Write-Output 'SteamVR observation interval complete.'; break }
             throw 'Client time limit reached.'
         }
-        $server = Get-Process OVRServer_x64 -ErrorAction SilentlyContinue
+        # One process listing for all four exit/restart guards (still every pass).
+        $watched = @(Get-Process OVRServer_x64,OculusDash,vrserver,vrcompositor -ErrorAction SilentlyContinue)
+        $server = $watched | Where-Object Name -eq 'OVRServer_x64'
         if (-not $server -or $server.Id -ne $serverId) { throw 'VR server exited/restarted during client test.' }
-        if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash appeared during client test.' }
+        if ($watched | Where-Object Name -eq 'OculusDash') { throw 'Dash appeared during client test.' }
         if ($SteamVR) {
-            $ss = Get-Process vrserver -ErrorAction SilentlyContinue
-            $sc = Get-Process vrcompositor -ErrorAction SilentlyContinue
+            $ss = $watched | Where-Object Name -eq 'vrserver'
+            $sc = $watched | Where-Object Name -eq 'vrcompositor'
             if (($DashboardSameIntegrityTrial -or $DashboardNormalUserTrial) -and (@($ss).Count -gt 1 -or @($sc).Count -gt 1)) { throw 'Multiple SteamVR servers/compositors appeared after bootstrap.' }
             if ($DashboardNormalUserTrial -and -not $dashboardTrialState -and ((Get-Date)-$observationStart).TotalSeconds -gt 3) {
                 @(Get-Process vrdashboard,vrwebhelper -ErrorAction SilentlyContinue | ForEach-Object {
@@ -693,14 +863,8 @@ try {
                 if ($VRChatTrial) {
                     Write-Output ('VR ready. Start your SteamVR game. Stop policy: ' + $cutoffLabel + '. When done, quit the game and use Stop & restore.')
                     # v3: optional read-only frame-timing capture (PresentMon). Never affects the session.
-                    $presentMonExe = Join-Path $root 'PresentMon.exe'
-                    if ($ManualSession -and (Test-Path -LiteralPath $presentMonExe)) {
-                        try {
-                            $pmArgs = '--process_name VRChat.exe --process_name OVRServer_x64.exe --output_file "' + (Join-Path $out 'presentmon.csv') + '" --no_console_stats --no_track_input --session_name ArcRiftPM --stop_existing_session'
-                            $presentMonProcess = Start-Process -FilePath $presentMonExe -ArgumentList $pmArgs -WindowStyle Hidden -PassThru
-                            Write-Output 'Frame-timing recorder (PresentMon) started: presentmon.csv in this session folder.'
-                        } catch { Write-Output ('PresentMon not started (session unaffected): ' + $_.Exception.Message) }
-                    }
+                    # Release 1.1.2: other SteamVR games are added when SteamVR reports them (see the game check below).
+                    if ($ManualSession -and (Test-Path -LiteralPath (Join-Path $root 'PresentMon.exe'))) { Start-ArcRiftPresentMon }
                     # v4: give SteamVR's and Meta's compositors high GPU/CPU priority (SteamVR runs as a normal user, so it
                     # cannot raise its own). Lives only as long as those processes; never fails the session.
                     if ($ManualSession) {
@@ -734,7 +898,20 @@ public static class ArcRiftGpuPriority {
                 }
             }
         }
-        Start-Sleep -Milliseconds 100
+        if ($presentMonProcess -and (Get-Date) -ge $nextGameCheck) {
+            # Add any newly connected SteamVR game to the frame-timing capture. Read-only; never fails the session.
+            $nextGameCheck = (Get-Date).AddSeconds(2)
+            try {
+                $newGames = @()
+                $vrserverText = Read-AppendedBridgeLog (Join-Path $steamPath 'logs\vrserver.txt') ([ref]$vrserverLogOffset)
+                foreach ($m in [regex]::Matches($vrserverText, 'New Connect message from (.+?\.exe) \(VRApplication_Scene\)')) {
+                    $exe = [IO.Path]::GetFileName($m.Groups[1].Value)
+                    if ($exe -and $exe -notin $presentMonGames -and $exe -notin $newGames) { $newGames += $exe }
+                }
+                if ($newGames.Count) { $presentMonGames += $newGames; Start-ArcRiftPresentMon }
+            } catch { Write-Output ('Game check for frame timing skipped (session unaffected): ' + $_.Exception.Message) }
+        }
+        Start-Sleep -Milliseconds 250
     }
     if ($SteamVR) {
         Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($steamRoot + '\', [StringComparison]::OrdinalIgnoreCase) } | Select-Object Name,Id,Path | Export-Clixml (Join-Path $out 'steamvr-processes.xml')
@@ -757,13 +934,7 @@ public static class ArcRiftGpuPriority {
     $failed = $true
     Write-Output ('TEST STOP: ' + $_.Exception.Message)
 } finally {
-    if ($presentMonProcess) {
-        try {
-            $pmStop = Start-Process -FilePath (Join-Path $root 'PresentMon.exe') -ArgumentList '--session_name ArcRiftPM --terminate_existing_session' -WindowStyle Hidden -PassThru
-            $null = $pmStop.WaitForExit(5000)
-            if (-not $presentMonProcess.WaitForExit(5000)) { Stop-Process -Id $presentMonProcess.Id -Force -ErrorAction SilentlyContinue }
-        } catch { Write-Output ('PresentMon stop note (rollback unaffected): ' + $_.Exception.Message) }
-    }
+    Stop-ArcRiftPresentMon
     if ($VRChatTrial -and (Get-Process VRChat -ErrorAction SilentlyContinue)) {
         Write-Output 'VRChat is still running. Restoring display and runtime now; the game is not force-closed. Close it normally.'
     }
@@ -796,7 +967,7 @@ public static class ArcRiftGpuPriority {
             $remaining = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($steamRoot + '\', [StringComparison]::OrdinalIgnoreCase) })
             if ($remaining.Count) { throw 'Test-started SteamVR processes remain.' }
             foreach ($name in @('vrserver.txt','vrcompositor.txt','vrmonitor.txt','vrstartup.txt','vrdashboard.txt','vrclient_vrdashboard.txt','vrwebhelper_main.txt','vrclient_vrwebhelper_main.txt','vrclient_steam.txt','vrclient_vrcmd.txt','vrclient_vrmonitor.txt')) {
-                $log = Join-Path 'C:\Program Files (x86)\Steam\logs' $name
+                $log = Join-Path (Join-Path $steamPath 'logs') $name
                 if (Test-Path $log) { Copy-Item -LiteralPath $log -Destination $out }
             }
             if (Test-Path $steamConfig) { Copy-Item -LiteralPath $steamConfig -Destination (Join-Path $out 'steamvr-settings-after.json') }
@@ -818,7 +989,9 @@ public static class ArcRiftGpuPriority {
     }
     if ($changed) {
         try { Stop-ArcRiftMetaRuntime } catch { $failed = $true; Write-Output ('RUNTIME STOP ERROR: ' + $_.Exception.Message) }
-        Copy-Item -LiteralPath (Join-Path $root $bridgeLogName) -Destination (Join-Path $out 'bridge-log.txt') -ErrorAction Continue
+        # Only this session's part of the bridge log, not every earlier session's lines again.
+        try { [IO.File]::WriteAllText((Join-Path $out 'bridge-log.txt'), (Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogSessionStart))) }
+        catch { Write-Output ('Bridge log copy note (rollback unaffected): ' + $_.Exception.Message) }
         Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Oculus') -Filter 'Service_*.txt' | Where-Object { $_.LastWriteTime -ge $start -and $_.Length -gt 0 } | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination $out -ErrorAction Continue
         }
@@ -873,7 +1046,8 @@ public static class ArcRiftGpuPriority {
                 Start-Sleep -Seconds 1
                 & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-after-original-runtime.txt')
                 if ($LASTEXITCODE -ne 0) { continue }
-                $afterLayouts = Get-ActiveLayouts (Get-Content (Join-Path $out 'physical-after-original-runtime.txt') -Raw)
+                # A probe taken while the display is still settling may list no active layout yet: retry, don't fail.
+                try { $afterLayouts = Get-ActiveLayouts (Get-Content (Join-Path $out 'physical-after-original-runtime.txt') -Raw) } catch { continue }
                 $same = $afterLayouts.Count -eq $baselineLayouts.Count
                 foreach ($id in $baselineLayouts.Keys) { if ($afterLayouts[$id] -ne $baselineLayouts[$id]) { $same = $false } }
                 if ($same) { $restored = $true; break }

@@ -291,7 +291,10 @@ public:
         HRESULT hr = chain->GetBuffer(0, IID_PPV_ARGS(&back));
         if (FAILED(hr)) return ovrError_Unsupported;
         context->CopyResource(back.Get(), surface->texture.Get());
-        if (frames == 30 || (frames != 0 && frames % 120 == 0)) SampleOutput(back.Get());
+        // Release 1.1.2: one full readback at frame 30 proves output; after that only a cheap progress line every
+        // 120 frames (the session uses it for its fps/freeze checks). A recurring readback stalled this thread for a frame.
+        if (frames == 30) SampleOutput(back.Get());
+        else if (frames != 0 && frames % 120 == 0) Trace("Output surface frame=%u readback=skipped", frames);
         hr = chain->Present(1, 0);
         if (frames++ == 0 || FAILED(hr)) Trace("Present frame=%u result=%08lx", frames, hr);
         MSG message{};

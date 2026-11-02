@@ -9,7 +9,7 @@ try {
     Write-Host 'Handle login yourself; start seated in your home/private instance.'
     if ($ManualSession) { Write-Host 'Quit VRChat, then use STOP AND RESTORE.cmd. Never kill the harness window. Recovery is best effort, not a guarantee.' }
     else { Write-Host 'Watch the displayed cutoff time and EXIT VRChat BEFORE it. Cleanup does not force-kill the game.' }
-    Write-Host 'For early cleanup use stop-arc-rift.cmd HERE in ArcRiftLab, not the Desktop backup copy.'
+    Write-Host 'For early cleanup use Stop & restore in ArcRift Control, or STOP AND RESTORE.cmd in this folder.'
     Write-Host 'Do not close the elevated harness window; let rollback finish.'
     $harness = Join-Path $PSScriptRoot 'test-ovr-d3d11.ps1'
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $harness + '" -Visual -NativeTiming -NativeSource -SteamVR -LegacyCheckpointSteamTrial -UserLaunchSteamTrial -DashboardNormalUserTrial -VRChatTrial'

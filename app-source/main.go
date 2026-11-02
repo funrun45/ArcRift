@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -29,7 +30,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const appVersion = "1.1.1"
+const appVersion = "1.1.2"
 
 var (
 	root      string
@@ -37,6 +38,7 @@ var (
 	lastHit   = time.Now()
 	lastHitMu sync.Mutex
 
+	startMu     sync.Mutex // one Start at a time: a double click must not launch two sessions
 	wrapperMu   sync.Mutex
 	wrapperProc *os.Process
 	wrapperDone = true
@@ -104,11 +106,87 @@ func pidAlive(procs map[string][]uint32, pid int) bool {
 	return false
 }
 
+// processCreated returns when a process started (needs only limited query access, so it works for the elevated harness).
+func processCreated(pid int) (time.Time, bool) {
+	h, err := syscall.OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, uint32(pid))
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer syscall.CloseHandle(h)
+	var created, exited, kernel, user syscall.Filetime
+	if syscall.GetProcessTimes(h, &created, &exited, &kernel, &user) != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, created.Nanoseconds()), true
+}
+
+// harnessRunning: the marker's PID is alive AND that process started before the marker was written,
+// so a later program that reused the PID is not mistaken for the session window.
+func harnessRunning(procs map[string][]uint32, pid int, started time.Time) bool {
+	if pid <= 0 || !pidAlive(procs, pid) {
+		return false
+	}
+	created, ok := processCreated(pid)
+	if !ok || started.IsZero() {
+		return true // cannot tell; keep the old PID-only behaviour
+	}
+	return !created.After(started.Add(5 * time.Second))
+}
+
+// lockHeld reports whether a session or recovery currently holds active-test.lock (they open it without sharing).
+func lockHeld() bool {
+	f, err := os.Open(filepath.Join(root, "active-test.lock"))
+	if err == nil {
+		f.Close()
+		return false
+	}
+	return errors.Is(err, syscall.Errno(32)) // ERROR_SHARING_VIOLATION
+}
+
+// regString reads a string value from the registry; "" if it is missing.
+func regString(key syscall.Handle, path, name string) string {
+	p, _ := syscall.UTF16PtrFromString(path)
+	var h syscall.Handle
+	if syscall.RegOpenKeyEx(key, p, 0, syscall.KEY_READ, &h) != nil {
+		return ""
+	}
+	defer syscall.RegCloseKey(h)
+	n, _ := syscall.UTF16PtrFromString(name)
+	var typ, size uint32
+	if syscall.RegQueryValueEx(h, n, nil, &typ, nil, &size) != nil || size < 2 {
+		return ""
+	}
+	buf := make([]uint16, size/2+1)
+	if syscall.RegQueryValueEx(h, n, nil, &typ, (*byte)(unsafe.Pointer(&buf[0])), &size) != nil {
+		return ""
+	}
+	return syscall.UTF16ToString(buf)
+}
+
+// steamFolder finds Steam from its own registry entry (same lookup as install-paths.ps1), else the default folder.
+func steamFolder() string {
+	if p := strings.ReplaceAll(regString(syscall.HKEY_CURRENT_USER, `Software\Valve\Steam`, "SteamPath"), "/", `\`); p != "" && fileExists(filepath.Join(p, "steam.exe")) {
+		return filepath.Clean(p)
+	}
+	return filepath.Join(os.Getenv("ProgramFiles(x86)"), "Steam")
+}
+
+// metaFolder finds the Meta Horizon install folder from its runtime service, else "".
+func metaFolder() string {
+	image := strings.Trim(regString(syscall.HKEY_LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Services\OVRService`, "ImagePath"), `" `)
+	if i := strings.Index(strings.ToLower(image), `\support\oculus-runtime\`); i > 0 {
+		return image[:i]
+	}
+	return ""
+}
+
 // ---------- session files ----------
 
 var (
 	reSessionDir = regexp.MustCompile(`<S N="SessionDirectory">([^<]*)</S>`)
 	reHarnessPid = regexp.MustCompile(`<I32 N="HarnessPid">(\d+)</I32>`)
+	// Get-Date serializes as <Obj N="Started" ...><DT>time</DT>; a plain DateTime as <DT N="Started">time</DT>.
+	reStarted = regexp.MustCompile(`N="Started"[^>]*>\s*(?:<DT>)?([0-9][^<\s]*)`)
 	reCleanup    = regexp.MustCompile(`"CleanupVerified":\s*(true|false)`)
 )
 
@@ -187,6 +265,9 @@ func sessionResult(dir string) (string, string) {
 	} else if strings.Contains(t, "User requested early stop") {
 		reason = "Stopped by you"
 	}
+	if fileExists(filepath.Join(dir, "recovery-dismissed.txt")) {
+		return "cleared", reason
+	}
 	recov, _ := filepath.Glob(filepath.Join(dir, "manual-recovery-2*.txt"))
 	for _, r := range recov {
 		if strings.Contains(readText(r, 0), "RECOVERY VERIFIED") {
@@ -237,7 +318,7 @@ func currentGame(procs map[string][]uint32) string {
 	if len(procs["vrserver.exe"]) == 0 {
 		return ""
 	}
-	log := filepath.Join(os.Getenv("ProgramFiles(x86)"), `Steam\logs\vrserver.txt`)
+	log := filepath.Join(steamFolder(), `logs\vrserver.txt`)
 	m := reSceneApp.FindAllStringSubmatch(readText(log, 512*1024), -1)
 	if len(m) == 0 {
 		return ""
@@ -332,7 +413,11 @@ func status() map[string]any {
 		if m := reHarnessPid.FindStringSubmatch(marker); m != nil {
 			pid, _ = strconv.Atoi(m[1])
 		}
-		harnessAlive = pid > 0 && pidAlive(procs, pid)
+		var started time.Time
+		if m := reStarted.FindStringSubmatch(marker); m != nil {
+			started, _ = time.Parse(time.RFC3339Nano, m[1])
+		}
+		harnessAlive = harnessRunning(procs, pid, started)
 		cleaned := false
 		if m := reCleanup.FindStringSubmatch(readText(filepath.Join(sessionDir, "manual-recovery-state.json"), 0)); m != nil {
 			cleaned = m[1] == "true"
@@ -348,6 +433,8 @@ func status() map[string]any {
 			state = "starting"
 		case cleaned:
 			state = "idle"
+		case lockHeld():
+			state = "recovering" // the automatic recovery watcher (or Recover) is restoring right now
 		default:
 			state = "recovery"
 		}
@@ -444,6 +531,8 @@ func fileExists(p string) bool {
 // ---------- actions ----------
 
 func startSession() (string, error) {
+	startMu.Lock()
+	defer startMu.Unlock()
 	st := status()
 	if st["state"] != "idle" {
 		return "", fmt.Errorf("a session is already %v", st["state"])
@@ -493,10 +582,14 @@ func runCapture(cmd *exec.Cmd, timeout time.Duration) string {
 }
 
 func openDebugTool() string {
-	for _, p := range []string{
+	candidates := []string{
 		`C:\Program Files\Meta Horizon\Support\oculus-diagnostics\OculusDebugTool.exe`,
 		`C:\Program Files\Oculus\Support\oculus-diagnostics\OculusDebugTool.exe`,
-	} {
+	}
+	if base := metaFolder(); base != "" {
+		candidates = append([]string{filepath.Join(base, `Support\oculus-diagnostics\OculusDebugTool.exe`)}, candidates...)
+	}
+	for _, p := range candidates {
 		if fileExists(p) {
 			exec.Command(p).Start()
 			return "Oculus Debug Tool opened. Set 'Bypass Proximity Sensor Check' to On (after the session says Running), and close it before stopping."
@@ -575,7 +668,7 @@ func headsetSerial(devices []pnpDevice) (string, string) {
 			return m[1], "Meta runtime log"
 		}
 	}
-	for _, p := range []string{filepath.Join(os.Getenv("ProgramFiles(x86)"), `Steam\config\steamvr.vrsettings`)} {
+	for _, p := range []string{filepath.Join(steamFolder(), `config\steamvr.vrsettings`)} {
 		if m := reSteamSer.FindStringSubmatch(readText(p, 0)); m != nil {
 			return m[1], "SteamVR settings"
 		}
@@ -720,6 +813,13 @@ func main() {
 		}
 		go cmd.Wait()
 		return map[string]any{"ok": true, "message": "Recovery started. Approve the administrator prompt; status updates when it finishes."}, nil
+	}))
+	mux.HandleFunc("/api/dismiss", api(func(r *http.Request) (any, error) {
+		if status()["state"] != "recovery" {
+			return nil, fmt.Errorf("there is no session waiting for recovery")
+		}
+		out := runCapture(psFile("dismiss-recovery.ps1"), 30*time.Second)
+		return map[string]any{"ok": !fileExists(filepath.Join(root, "active-test.xml")), "message": out}, nil
 	}))
 	mux.HandleFunc("/api/open-folder", api(func(r *http.Request) (any, error) {
 		d := r.URL.Query().Get("which")
