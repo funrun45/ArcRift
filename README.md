@@ -23,6 +23,8 @@ by Meta, Oculus, Intel or Valve.
   when you start a session
 - Microsoft Edge (comes with Windows 11; used to show the app window)
 
+## Join the discord for questions or suggestions 
+https://discord.gg/aXRV5XjZM
 ## First-time setup
 
 1. Keep this whole folder together, somewhere like `Documents\ArcRift`.
