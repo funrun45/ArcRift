@@ -23,16 +23,22 @@ by Meta, Oculus, Intel or Valve.
   when you start a session
 - Microsoft Edge (comes with Windows 11; used to show the app window)
 
-## Join the discord for questions or suggestions 
-https://discord.gg/aXRV5XjZM
+## Download and install
+
+1. Go to the [latest release](https://github.com/funrun45/ArcRift/releases/latest) and download the release
+   `.zip` under **Assets** (not *Source code*, which has no built programs).
+2. Extract the whole ZIP, for example to `Downloads\ArcRift-1.1.2`. Keep all the files in that folder together.
+3. Open the extracted folder and run **ArcRift Control.exe**
+   (for example `Downloads\ArcRift-1.1.2\ArcRift-1.1.2\ArcRift Control.exe`).
+
+To update, download the newest release the same way and run **ArcRift Control.exe** from the new folder.
+Run Setup again in the new version.
+
 ## First-time setup
 
-1. Keep this whole folder together, somewhere like `Documents\ArcRift`.
-2. If the folder has no `arc_rift_bridge.dll` / `release-manifest.json` (for example a source-only download),
-   run **BUILD-RELEASE.cmd** once. It needs the free *Visual Studio 2022 C++ Build Tools*.
-3. Open **ArcRift Control.exe** → **Setup**. With the Meta Horizon app open and the headset light on,
-   follow the 3 steps (plugged in → unplugged → plugged back in) and press **Save**.
-   Setup records which display is your headset and which GPU you have. Start stays disabled until this is done.
+In **ArcRift Control.exe**, open **Setup**. With the Meta Horizon app open and the headset light on,
+follow the 3 steps (plugged in → unplugged → plugged back in) and press **Save**.
+Setup records which display is your headset and which GPU you have. Start stays disabled until this is done.
 
 ## Playing
 
@@ -79,6 +85,20 @@ https://discord.gg/aXRV5XjZM
   and enable the particle limiter.
 - **No ASW:** Meta's frame smoothing (ASW) does not run on Intel Arc.
 - The upstream project this builds on warns that Meta's runtime can, rarely, need a PC restart.
+
+## Building from source
+
+You only need this if you cloned the repository or downloaded *Source code* instead of the release ZIP
+(the folder has no `arc_rift_bridge.dll` / `release-manifest.json`).
+
+1. Install the free *Visual Studio 2022 C++ Build Tools* and [Go](https://go.dev/dl/) 1.25 or newer.
+2. Keep the whole folder together, somewhere like `Documents\ArcRift`.
+3. Run **BUILD-RELEASE.cmd** once. It builds the bridge and helpers and writes `release-manifest.json`.
+4. Build the app from the `app-source` folder:
+   ```bash
+   go build -ldflags "-H windowsgui" -o "..\ArcRift Control.exe" .
+   ```
+5. Run **ArcRift Control.exe** and continue with [First-time setup](#first-time-setup).
 
 ## Folder contents
 
