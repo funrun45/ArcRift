@@ -4,6 +4,8 @@ arcrift-identity.txt
 d3d11-*/
 active-test.xml
 active-test.lock
+boundary-*.txt
+boundary-*.json
 *.log
 
 # Build intermediates
@@ -17,3 +19,9 @@ source/build/
 *.exe
 *.dll
 release-manifest.json
+
+# Local backups, release ZIPs and editor settings
+*.bak
+pre-*-backup-*/
+release/
+.claude/

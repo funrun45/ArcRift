@@ -10,6 +10,7 @@ here only to describe compatibility.
 | Component | Author | Licence | File |
 |---|---|---|---|
 | DirectDisplay interface definitions used by the bridge (`source\ovr_direct_display.h`, `source\arc_rift_bridge.cpp`) | Bnuuy Solutions, [OculusDirectDisplayAdditions](https://github.com/BnuuySolutions/OculusDirectDisplayAdditions) | MIT | `OculusDirectDisplayAdditions-LICENSE.txt` |
+| OpenVR API header (`source\openvr\openvr.h`, unmodified), used by `arcrift_boundary.exe`; it loads SteamVR's own `openvr_api.dll` at runtime | Valve Corporation, [OpenVR](https://github.com/ValveSoftware/openvr) | BSD-3-Clause | `source\openvr\LICENSE` |
 | PresentMon 2.3.1 (`PresentMon.exe`, unmodified official release) | Intel GameTechDev | MIT | `PresentMon-LICENSE.txt` |
 | Rift S display timing research behind `rift-s-native-test.edid` / `source\make_edid.py` | [OpenHMD](https://github.com/OpenHMD/OpenHMD) contributors, [thaytan/RiftS-Experiments](https://github.com/thaytan/RiftS-Experiments) | credit only (no code included) | — |
 

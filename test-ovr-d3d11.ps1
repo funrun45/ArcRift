@@ -1,6 +1,6 @@
 # One bounded integration attempt. Run elevated; never an installation script.
 param([switch]$Visual, [switch]$NativeTiming, [switch]$LinkDiagnostics, [switch]$NativeSource, [switch]$Stereo, [switch]$TrackedScene, [switch]$SteamVR,
-    [ValidateRange(15,600)][int]$SteamVRSeconds = 30, [switch]$IsolatedHeadsetTrial, [switch]$LegacyCheckpointTrial, [switch]$NoReadbackSteamTrial, [switch]$UserLaunchSteamTrial, [switch]$StartupIdentityHeadsetTrial, [switch]$LegacyCheckpointSteamTrial, [switch]$OriginalSteamVRBaselineTrial, [switch]$DashboardSameIntegrityTrial, [switch]$DashboardNormalUserTrial, [switch]$VRChatTrial, [switch]$ManualSession)
+    [ValidateRange(15,600)][int]$SteamVRSeconds = 30, [switch]$IsolatedHeadsetTrial, [switch]$LegacyCheckpointTrial, [switch]$NoReadbackSteamTrial, [switch]$UserLaunchSteamTrial, [switch]$StartupIdentityHeadsetTrial, [switch]$LegacyCheckpointSteamTrial, [switch]$OriginalSteamVRBaselineTrial, [switch]$DashboardSameIntegrityTrial, [switch]$DashboardNormalUserTrial, [switch]$VRChatTrial, [switch]$ManualSession, [switch]$GuardianSetup)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location -LiteralPath $root
@@ -70,6 +70,7 @@ $manualRecoveryFile = Join-Path $out 'manual-recovery-state.json'
 $manualDiskCheckAt = Get-Date
 # Release 1.1: headset/GPU identity comes from Setup (arcrift-config.json), not from fixed IDs.
 $arcConfigError = $null
+$gpuNote = $null
 $monitorInstance = ''
 $targetId = 0
 try {
@@ -82,6 +83,26 @@ try {
     if ($monitorInstance -notmatch '^(?i)DISPLAY\\[^\\]+\\[^\\]+$' -or $targetId -le 0 -or -not $gpuMatch.Success) { throw 'arcrift-config.json is incomplete. Run Setup in ArcRift Control again.' }
     if ($gpuMatch.Groups[1].Value -ne '8086') { throw 'The GPU saved by Setup is not an Intel GPU; this release only supports Intel Arc.' }
     $identityLines = @(('target=' + $targetId), ('monitor=' + ($monitorInstance -replace '\\', '#') + '#'), ('gpu=' + $gpuMatch.Groups[1].Value + ':' + $gpuMatch.Groups[2].Value))
+    # Release 1.3 (other Intel cards): the bridge only accepts the graphics card the headset is really plugged into, by
+    # its exact device ID. Setup used to guess that card by name, which can pick the wrong one on a PC with two Intel
+    # adapters (processor graphics plus an Arc card). Windows knows the answer: the headset monitor's parent device is
+    # the card it is plugged into. Read-only; if it cannot be read, the card saved by Setup is used as before.
+    $gpuProblem = $null
+    try {
+        $headsetAdapter = [string](Get-PnpDeviceProperty -InstanceId $monitorInstance -KeyName DEVPKEY_Device_Parent -ErrorAction Stop).Data
+        $adapterMatch = [regex]::Match($headsetAdapter, '(?i)VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})')
+        if ($adapterMatch.Success) {
+            $adapterId = ($adapterMatch.Groups[1].Value + ':' + $adapterMatch.Groups[2].Value).ToUpperInvariant()
+            $savedId = ($gpuMatch.Groups[1].Value + ':' + $gpuMatch.Groups[2].Value).ToUpperInvariant()
+            if ($adapterMatch.Groups[1].Value -ne '8086') {
+                $gpuProblem = 'The headset is plugged into a graphics card that is not an Intel card (' + $adapterId + '). Plug its DisplayPort cable into the Intel Arc card, then run Setup again. No changes made.'
+            } elseif ($adapterId -ne $savedId) {
+                $identityLines += ('gpu=' + $adapterId)
+                $gpuNote = 'Note: the headset is plugged into Intel graphics device ' + $adapterId + ', but Setup saved ' + $savedId + '. Using the card it is plugged into. Run Setup again to update the saved card.'
+            }
+        }
+    } catch { }
+    if ($gpuProblem) { throw $gpuProblem }
     Set-Content -LiteralPath (Join-Path $root 'arcrift-identity.txt') -Value $identityLines -Encoding Ascii
     # Rift S display mode (EDID) for this headset: public Rift S capture timings + this headset's serial,
     # which Meta uses to pair the display with the headset. Rebuilt every session; never flashed to hardware.
@@ -107,14 +128,44 @@ try {
 } catch { $arcConfigError = $_.Exception.Message }
 $monitorParent = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + $monitorInstance + '\Device Parameters'
 $edidKey = $monitorParent + '\EDID_OVERRIDE'
+# Release 1.3 (other Intel cards): how display_probe.exe output is read.
+#  * A display path is active when bit 0 of its flags is set. The flags are printed in hex, and Windows can set more
+#    bits on newer builds and other cards; matching the text "pathFlags=1" made such an active display look inactive.
+#  * The headset is matched by its monitor device path as well as its target ID: two graphics adapters (processor
+#    graphics plus an Arc card) can use the same target ID for different monitors.
+$activePathFlags = 'pathFlags=[0-9a-fA-F]*[13579bdfBDF] '
+$headsetPathId = (($monitorInstance -replace '\\', '#') + '#').ToLowerInvariant()
 function Get-ActiveLayouts([string]$Text) {
     $layouts = @{}
-    $pattern = '(?m)^\s*target=(\d+) [^\r\n]*pathFlags=1[^\r\n]*\r?\n[^\r\n]*\r?\n\s*(signal=[^\r\n]+)\r?\n\s*(source=[^\r\n]+)'
+    $pattern = '(?m)^\s*target=(\d+) [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n([^\r\n]*)\r?\n\s*(signal=[^\r\n]+)\r?\n\s*(source=[^\r\n]+)'
     foreach ($m in [regex]::Matches($Text, $pattern)) {
-        $layouts[$m.Groups[1].Value] = $m.Groups[2].Value.Trim() + ' ' + $m.Groups[3].Value.Trim()
+        $path = [regex]::Match($m.Groups[2].Value, 'path=(\S+)')
+        $key = $m.Groups[1].Value
+        if ($path.Success) { $key += '|' + $path.Groups[1].Value.ToLowerInvariant() }
+        $layouts[$key] = $m.Groups[3].Value.Trim() + ' ' + $m.Groups[4].Value.Trim()
     }
     if ($layouts.Count -eq 0) { throw 'No active display layouts parsed.' }
     return $layouts
+}
+# The key of the headset's entry in a Get-ActiveLayouts result, or $null when the headset from Setup is not active.
+function Get-ArcRiftHeadsetLayoutKey($Layouts, [int]$Target) {
+    foreach ($key in $Layouts.Keys) {
+        if ($key.StartsWith([string]$Target + '|') -and $key.Contains($headsetPathId)) { return $key }
+    }
+    return $null
+}
+# Release 1.2: one-line description of the headset display in a display_probe.exe capture, for when the native mode
+# did not appear. On a working PC the headset shows name=Rift S, EDID=d23e:0012 (ArcRift's temporary EDID) and
+# signal=1440x2560; the original generic EDID means Windows never picked up the temporary display mode.
+function Get-ArcRiftHeadsetModeReport([string]$Probe, [int]$Target, [bool]$OverridePresent) {
+    $m = [regex]::Match($Probe, '(?m)^\s*target=' + $Target + ' [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n\s*name=([^\r\n]*?) path=[^\r\n]*?(?i:' + [regex]::Escape($headsetPathId) + ')[^\r\n]*?EDID=(\S+)\s*\r?\n\s*signal=(\S+)[^\r\n]*?vSync=(\d+)/(\d+)')
+    $override = if ($OverridePresent) { 'temporary EDID is still set' } else { 'temporary EDID is missing from the registry' }
+    if (-not $m.Success) { return ('headset display is not active in Windows; ' + $override) }
+    $hz = if ([double]$m.Groups[5].Value) { [math]::Round([double]$m.Groups[4].Value / [double]$m.Groups[5].Value, 1) } else { 0 }
+    $signal = $m.Groups[3].Value + ' at ' + $hz + ' Hz'
+    $name = if ($m.Groups[1].Value) { $m.Groups[1].Value } else { 'no name' }
+    if ($m.Groups[2].Value -eq 'd23e:0012') { return ('Windows uses the temporary Rift S EDID (' + $name + ') but the headset runs at ' + $signal + '; ' + $override) }
+    return ('Windows still shows the original headset EDID ' + $m.Groups[2].Value + ' (' + $name + ') at ' + $signal + ', so the temporary display mode was not picked up; ' + $override)
 }
 function Stop-ArcRiftMetaRuntime([int]$TimeoutSeconds = 20) {
     # Stop Meta's runtime without waiting forever: if it hangs, end its processes so rollback can continue.
@@ -235,11 +286,15 @@ function Start-ArcRiftPresentMon {
         Write-Output ('Frame-timing recorder (PresentMon) started: ' + $csv + ' in this session folder (' + ($script:presentMonGames -join ', ') + ').')
     } catch { Write-Output ('PresentMon not started (session unaffected): ' + $_.Exception.Message) }
 }
-function Read-AppendedBridgeLog([string]$Path, [ref]$Offset) {
+function Read-AppendedBridgeLog([string]$Path, [ref]$Offset, [switch]$OnlyIfGrown) {
     $stream = $null
     $reader = $null
     try {
         if (-not (Test-Path -LiteralPath $Path)) { return '' }
+        # OnlyIfGrown (bridge log): the bridge opens its log exclusively for every line, so a line it writes while this
+        # script has the file open is lost (seen: 4 of 2948 progress lines in one session). Checking the size opens
+        # nothing; the file is then only opened right after the bridge has finished a line.
+        if ($OnlyIfGrown -and (New-Object IO.FileInfo($Path)).Length -eq $Offset.Value) { return '' }
         $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
         if ($stream.Length -lt $Offset.Value) { $Offset.Value = 0L }
         $null = $stream.Seek($Offset.Value,[IO.SeekOrigin]::Begin)
@@ -251,10 +306,29 @@ function Read-AppendedBridgeLog([string]$Path, [ref]$Offset) {
         if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() }
     }
 }
+# Release 1.2: refuse to start while SteamVR/VRChat is already open, and say exactly which program and what to do.
+# Single line on purpose: the dashboard shows the "TEST STOP: ..." line as the session's reason.
+function Assert-ArcRiftNoVRRunning {
+    $running = @(Get-Process vrserver,vrcompositor,vrmonitor,vrcmd,VRChat,isolated_presenter_test -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.ProcessName + '.exe' } | Sort-Object -Unique)
+    if ($running.Count) {
+        throw ('SteamVR or VRChat is already running (' + ($running -join ', ') + '). ArcRift starts SteamVR itself: close VRChat and SteamVR, end any of those programs still listed in Task Manager > Details (or restart the PC), then start the session again. No changes made.')
+    }
+}
 Start-Transcript -Path (Join-Path $out 'transcript.txt')
 try {
     if ($arcConfigError) { throw $arcConfigError }
     Write-Output ('Headset display ' + $monitorInstance + ' (target ' + $targetId + ') from Setup.')
+    if ($gpuNote) { Write-Output $gpuNote }
+    # Release 1.3 (other Intel cards): record which card, driver and Windows build this session ran on, so a report
+    # from an untested card says what it was. Read-only; never fails the session.
+    try {
+        $osBuild = [Environment]::OSVersion.Version.Build
+        $systemInfo = @('Windows build ' + $osBuild)
+        foreach ($g in @(Get-CimInstance Win32_VideoController -ErrorAction Stop)) { $systemInfo += ('GPU: ' + $g.Name + ' | driver ' + $g.DriverVersion + ' | ' + ($g.PNPDeviceID -replace '&SUBSYS.*$', '')) }
+        Set-Content -LiteralPath (Join-Path $out 'system-info.txt') -Value $systemInfo
+        if ($osBuild -lt 22000) { Write-Output 'Note: this PC runs Windows 10. ArcRift is only tested on Windows 11; if the headset display mode does not switch, that may be why.' }
+    } catch { }
     if ($ManualSession -and -not $VRChatTrial) { throw 'ManualSession requires explicit VRChatTrial/menu-working mode.' }
     if ($VRChatTrial -and -not $DashboardNormalUserTrial) { throw 'VRChatTrial requires the menu-working DashboardNormalUserTrial; other rendering/launch modes refused.' }
     if ($DashboardNormalUserTrial -and (-not ($LegacyCheckpointSteamTrial -and $UserLaunchSteamTrial) -or $OriginalSteamVRBaselineTrial -or $DashboardSameIntegrityTrial)) { throw 'DashboardNormalUserTrial requires exact legacy renderer with normal-user launching, not elevated-baseline/UI-replacement modes.' }
@@ -265,7 +339,7 @@ try {
     if (([int][bool]$IsolatedHeadsetTrial + [int][bool]$LegacyCheckpointTrial + [int][bool]$NoReadbackSteamTrial + [int][bool]$StartupIdentityHeadsetTrial + [int][bool]$LegacyCheckpointSteamTrial) -gt 1) { throw 'Choose only one backend trial.' }
     if ($NoReadbackSteamTrial) {
         if (-not ($Visual -and $NativeTiming -and $NativeSource -and $SteamVR) -or $Stereo -or $TrackedScene -or $LinkDiagnostics) { throw 'NoReadbackSteamTrial requires only Visual/NativeTiming/NativeSource/SteamVR; no game or other render modes.' }
-        if (Get-Process vrserver,vrcompositor,vrmonitor,vrcmd,VRChat,isolated_presenter_test -ErrorAction SilentlyContinue) { throw 'Another VR/graphics test is running.' }
+        Assert-ArcRiftNoVRRunning
         if ((Get-FileHash -LiteralPath (Join-Path $root 'arc_rift_bridge.dll') -Algorithm SHA256).Hash -ne 'c9fad8ed975c900d58d39cfce96cdc01608a388ce675f4f6b45fc8e18685a485') { throw 'Saved legacy reference was changed.' }
         $bridgeName = 'arc_rift_bridge_noreadback.dll'
         $bridgeLogName = 'arc-rift-bridge-noreadback.log'
@@ -273,7 +347,7 @@ try {
         Write-Output 'Explicit 20-second SteamVR-only A/B trial: legacy rendering path with recurring readbacks disabled. Saved DLL untouched.'
     } elseif ($LegacyCheckpointSteamTrial) {
         if (-not ($Visual -and $NativeTiming -and $NativeSource -and $SteamVR -and ($UserLaunchSteamTrial -or $OriginalSteamVRBaselineTrial)) -or $Stereo -or $TrackedScene -or $LinkDiagnostics) { throw 'LegacyCheckpointSteamTrial requires Visual/NativeTiming/NativeSource/SteamVR and one explicit launch mode; no games or other render modes.' }
-        if (Get-Process vrserver,vrcompositor,vrmonitor,vrcmd,VRChat,isolated_presenter_test -ErrorAction SilentlyContinue) { throw 'Another VR/graphics test is running.' }
+        Assert-ArcRiftNoVRRunning
         # Release 1.1: verify every program against release-manifest.json (written by BUILD-RELEASE.cmd).
         $releaseManifestPath = Join-Path $root 'release-manifest.json'
         if (-not (Test-Path -LiteralPath $releaseManifestPath)) { throw 'release-manifest.json is missing. Run BUILD-RELEASE.cmd or reinstall the release.' }
@@ -299,14 +373,14 @@ try {
         }
     } elseif ($LegacyCheckpointTrial) {
         if (-not ($Visual -and $NativeTiming -and $NativeSource -and $Stereo) -or $SteamVR -or $TrackedScene -or $LinkDiagnostics) { throw 'LegacyCheckpointTrial is limited to 12-second stereo labels; no SteamVR or games.' }
-        if (Get-Process vrserver,vrcompositor,vrmonitor,vrcmd,VRChat,isolated_presenter_test -ErrorAction SilentlyContinue) { throw 'Another VR/graphics test is running.' }
+        Assert-ArcRiftNoVRRunning
         $expected = 'c9fad8ed975c900d58d39cfce96cdc01608a388ce675f4f6b45fc8e18685a485'
         $saved = Join-Path $root 'checkpoints\near-working-and-isolated-20261031-180448\tested-legacy\arc_rift_bridge.dll'
         if ((Get-FileHash -LiteralPath $saved -Algorithm SHA256).Hash -ne $expected -or (Get-FileHash -LiteralPath (Join-Path $root $bridgeName) -Algorithm SHA256).Hash -ne $expected) { throw 'Legacy DLL does not match saved tested checkpoint; refusing trial.' }
         Write-Output 'User-requested exact checkpoint DLL: 12-second legacy stereo test only. Known sustained instability; no permanent enablement.'
     } elseif ($isolatedRendererTrial) {
         if (-not ($Visual -and $NativeTiming -and $NativeSource -and $Stereo) -or $SteamVR -or $TrackedScene -or $LinkDiagnostics) { throw 'IsolatedHeadsetTrial requires Visual/NativeTiming/NativeSource/Stereo only; no SteamVR, games, or link diagnostics.' }
-        if (Get-Process vrserver,vrcompositor,vrmonitor,vrcmd,VRChat,isolated_presenter_test -ErrorAction SilentlyContinue) { throw 'Another VR/graphics test is running.' }
+        Assert-ArcRiftNoVRRunning
         $bridgeName = 'arc_rift_bridge_isolated.dll'
         $bridgeLogName = 'arc-rift-bridge-isolated.log'
         if ($StartupIdentityHeadsetTrial) {
@@ -316,6 +390,9 @@ try {
         }
         Write-Output 'Explicit isolated-only 12-second headset trial; legacy/SteamVR safety gate remains in place.'
     } elseif (Test-Path (Join-Path $root 'live-tests-paused.txt')) { throw 'Live tests paused after desktop corruption. Read live-tests-paused.txt; no runtime/display changes made.' }
+    # Release 1.2.1: Guardian setup session. Same display/bridge setup and guards as a normal session, but Meta's Dash
+    # is allowed (its Guardian setup shows your room through the headset cameras) and SteamVR is not started.
+    if ($GuardianSetup -and -not ($ManualSession -and $VRChatTrial)) { throw 'GuardianSetup is only for the manual ArcRift session.' }
     if ($NativeSource -and -not $NativeTiming) { throw 'NativeSource requires NativeTiming.' }
     if ($Stereo -and -not ($Visual -and $NativeSource)) { throw 'Stereo requires Visual and NativeSource.' }
     if ($TrackedScene -and (-not ($Visual -and $NativeSource) -or $Stereo)) { throw 'TrackedScene requires Visual and NativeSource, without Stereo.' }
@@ -328,6 +405,24 @@ try {
     }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Elevation required.' }
+    # Release 1.2.1: if an earlier session never finished cleanup (PC shut down, restarted, crashed or lost power during
+    # it, or its window was closed), from this folder or another ArcRift copy, restore it automatically before anything
+    # else. Uses that session's own backups and the normal Recover checks; nothing of this session is changed yet.
+    if ($ManualSession) {
+        . (Join-Path $root 'leftover-session.ps1')
+        $leftover = Find-ArcRiftLeftoverSession $root
+        if ($leftover) {
+            $from = if ($leftover.Foreign) { ' from ' + $leftover.Package } else { '' }
+            Write-Output ('The last session' + $from + ' was never restored (usually the PC was shut down or restarted during it). Restoring it automatically first; keep the headset plugged in...')
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'recover-manual-session.ps1') -SessionDirectory $leftover.SessionDirectory
+            if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath (Join-Path $leftover.Package 'active-test.xml'))) {
+                throw 'Automatic restore of the last session did not finish (see above). Check the headset is plugged in (USB and DisplayPort), close SteamVR and your game, then press Start again.'
+            }
+            $metaDeadline = (Get-Date).AddSeconds(30)
+            while (-not (Get-Process OVRServer_x64 -ErrorAction SilentlyContinue) -and (Get-Date) -lt $metaDeadline) { Start-Sleep -Milliseconds 500 }
+            Write-Output 'Last session restored. Continuing with the new session.'
+        }
+    }
     if ($DashboardSameIntegrityTrial) {
         & (Join-Path $root 'probe-process-integrity.ps1') | Out-File (Join-Path $out 'dashboard-harness-integrity.txt')
         . (Join-Path $root 'dashboard-integrity-trial.ps1')
@@ -341,13 +436,18 @@ try {
         New-Item -ItemType Directory -Path $preflight | Out-Null
         $workerProof = Start-ArcRiftSteamWorker -EvidenceDirectory $preflight -ProbeOnly
         if ($workerProof.Integrity -ne 8192) { throw 'Normal-user worker preflight failed.' }
-        if (-not (Get-Process steam -ErrorAction SilentlyContinue)) { throw 'Steam is not running. Start Steam and sign in, then start the session again; no changes made.' }
+        if (-not $GuardianSetup -and -not (Get-Process steam -ErrorAction SilentlyContinue)) { throw 'Steam is not running. Start Steam and sign in, then start the session again; no changes made.' }
         if (-not (Get-Process OVRServer_x64 -ErrorAction SilentlyContinue)) { throw 'Meta runtime is not running. Open the Meta Horizon app with the headset plugged in, then start the session again; no changes made.' }
         foreach ($p in @(Get-Process OVRServer_x64,steam,explorer -ErrorAction Stop)) {
-            if ([ArcRiftIntegrityProbe]::Integrity($p.Id) -ne 8192) { throw ('Participant is not Medium integrity: ' + $p.Name) }
+            $rid = [ArcRiftIntegrityProbe]::Integrity($p.Id)
+            # Release 1.3: an extra explorer.exe (opened for a folder window) can exit before it is checked. The
+            # desktop's own Explorer is checked again when SteamVR is launched through it.
+            if ($rid -lt 0 -and $p.Name -eq 'explorer' -and -not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { continue }
+            if ($rid -ne 8192) { throw ('Participant is not Medium integrity: ' + $p.Name) }
         }
         if ($VRChatTrial) {
-            if ($ManualSession) { Write-Output 'Manual-stop session: no time limit. Safety guards stay active. When done, quit your game and use Stop & restore.' }
+            if ($GuardianSetup) { Write-Output 'EXPERIMENTAL Guardian setup session: Meta Dash is allowed so Meta can run its Guardian setup (room view and controller drawing). SteamVR is not started. Safety guards stay active; when Guardian is saved, press Stop & restore.' }
+            elseif ($ManualSession) { Write-Output 'Manual-stop session: no time limit. Safety guards stay active. When done, quit your game and use Stop & restore.' }
             else { Write-Output 'Normal-user preflight passed. Five-minute VRChat observation; user handles normal Steam launch/login. Close VRChat before cutoff. Games are not force-terminated by this harness.' }
         } else {
             Write-Output ('Normal-user worker preflight passed without VR. Live trial is SteamVR-only, no games, fixed ' + $SteamVRSeconds + ' seconds.')
@@ -355,10 +455,13 @@ try {
     }
     if ((Get-Service OVRService).Status -ne 'Running') { throw 'Service is not in the expected original running state.' }
     if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash is already running; refusing to interrupt an existing session.' }
-    if (Test-Path -LiteralPath $edidKey) { throw 'EDID experiment already active.' }
+    if (Test-Path -LiteralPath $edidKey) { throw 'The headset display mode from an earlier ArcRift session is still applied, but no unrestored session was found to restore it from. Run RECOVER.cmd in the ArcRift folder you used last; no changes made.' }
     # Release 1.1.2: never back up "original" settings over a session that was not restored yet.
     if (Test-Path -LiteralPath $activeSession) { throw 'The previous session was not restored (active-test.xml exists). Run Recover in ArcRift Control or RECOVER.cmd first; no changes made.' }
-    $sessionLock = [IO.File]::Open($sessionLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    # Release 1.3: the lock is "held while open", not "the file exists". A lock file left behind by a session that was
+    # ended at the wrong moment used to make every later Start fail (CreateNew); now it is simply taken over.
+    try { $sessionLock = [IO.File]::Open($sessionLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::None) }
+    catch { throw 'Another ArcRift session or recovery is using this folder right now (active-test.lock is in use). Wait for it to finish, then start again; no changes made.' }
     [pscustomobject]@{SessionDirectory=$out; HarnessPid=$PID; Started=(Get-Date)} | Export-Clixml $activeSession
     if ($SteamVR) {
         if (-not (Test-Path (Join-Path $steamBin 'vrcmd.exe'))) { throw 'Installed SteamVR diagnostic is missing.' }
@@ -370,7 +473,7 @@ try {
     & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-baseline.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Baseline display probe failed.' }
     $baselineLayouts = Get-ActiveLayouts (Get-Content (Join-Path $out 'physical-baseline.txt') -Raw)
-    if (-not $baselineLayouts.ContainsKey([string]$targetId)) { throw 'Active headset source missing at baseline.' }
+    if (-not (Get-ArcRiftHeadsetLayoutKey $baselineLayouts $targetId)) { throw 'The headset display saved by Setup is not an active Windows display right now. Check the headset is plugged in (USB and DisplayPort) and awake with the Meta Horizon app open; if you moved it to another port or changed graphics card, run Setup again. No changes made.' }
     if ($NativeTiming) {
         $monitor = Get-PnpDevice -InstanceId $monitorInstance -PresentOnly
         if ($monitor.Class -ne 'Monitor') { throw 'Verified headset monitor is missing.' }
@@ -407,7 +510,7 @@ try {
     $settings = @(
         @{Path='HKLM:\SOFTWARE\Oculus'; Name='DirectDisplayDLL'; Value=(Join-Path $root $bridgeName); Kind='String'},
         @{Path='HKLM:\SOFTWARE\Oculus'; Name='ForceGPUDriverVersionAcceptance'; Value=1; Kind='DWord'},
-        @{Path='HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus\Config'; Name='PreventDashLaunch'; Value=1; Kind='DWord'}
+        @{Path='HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus\Config'; Name='PreventDashLaunch'; Value=$(if ($GuardianSetup) { 0 } else { 1 }); Kind='DWord'}
     )
     foreach ($s in $settings) {
         $had = $false; $value = $null; $kind = $null
@@ -475,7 +578,7 @@ try {
         $serverId = $null
         for ($i = 0; $i -lt 24; $i++) {
             Start-Sleep -Milliseconds 500
-            if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash started despite suppression; aborting.' }
+            if (-not $GuardianSetup -and (Get-Process OculusDash -ErrorAction SilentlyContinue)) { throw 'Dash started despite suppression; aborting.' }
             $server = Get-Process OVRServer_x64 -ErrorAction SilentlyContinue
             if ($server) {
                 if ($serverId -and $server.Id -ne $serverId) { throw 'VR server restarted; aborting.' }
@@ -490,7 +593,7 @@ try {
         while ($bootLog -notmatch ('Enumerate verified target ' + $targetId + '\b') -and (Get-Date) -lt $enumDeadline) {
             Start-Sleep -Milliseconds 500
             if (-not (Get-Process -Id $serverId -ErrorAction SilentlyContinue)) { throw 'VR server exited; aborting.' }
-            if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash started despite suppression; aborting.' }
+            if (-not $GuardianSetup -and (Get-Process OculusDash -ErrorAction SilentlyContinue)) { throw 'Dash started despite suppression; aborting.' }
             $moreBootLog = Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogOffset)
             $bootLog += $moreBootLog
             $candidateLogTail += $moreBootLog
@@ -512,7 +615,10 @@ try {
             New-ItemProperty $bridgeSetting.Path -Name $bridgeSetting.Name -Value $bridgeSetting.Value -PropertyType $bridgeSetting.Kind -Force | Out-Null
             continue
         }
-        throw 'Selected backend did not enumerate verified display during runtime startup; refusing timing/render changes.'
+        # Release 1.2: include the bridge's own reason (e.g. headset display not active in Windows) when it logged one.
+        $lookupFailures = [regex]::Matches($bootLog, 'headset display not found: ([^\r\n]+)')
+        $lookupReason = if ($lookupFailures.Count) { ' Bridge: ' + $lookupFailures[$lookupFailures.Count - 1].Groups[1].Value + '.' } else { '' }
+        throw ('Selected backend did not enumerate verified display during runtime startup; refusing timing/render changes.' + $lookupReason)
     }
     if ($LinkDiagnostics) {
         & (Join-Path $root 'igcl_probe.exe') --link-status | Out-File -Encoding utf8 (Join-Path $out 'link-before-native.txt')
@@ -528,11 +634,25 @@ try {
         Write-Output 'Temporary published native timing applied ONLY to verified Rift S monitor. Not a firmware write.'
         & pnputil.exe /restart-device $monitorInstance
         if ($LASTEXITCODE -ne 0) { throw 'Headset monitor restart failed.' }
+        # Release 1.2: some PCs (seen on an Arc B580) take longer than 6 s to bring the headset back in its native mode
+        # after the monitor restart. Check at 6 s as before, then every 2 s; the last capture is kept.
+        # Release 1.3: wait up to 45 s (was 20 s). A PC that is ready sooner continues at once, as before.
+        $nativeDeadline = (Get-Date).AddSeconds(45)
         Start-Sleep -Seconds 6
-        & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-after-runtime-start.txt')
-        $probe = Get-Content (Join-Path $out 'physical-display-after-runtime-start.txt') -Raw
-        $match = [regex]::Match($probe, '(?m)^\s*target=' + $targetId + ' [^\r\n]*pathFlags=1[^\r\n]*\r?\n[^\r\n]*\r?\n\s*signal=1440x2560 total=1752x4078 pixelClock=571570000 vSync=(\d+)/(\d+)')
-        if (-not $match.Success) { throw 'Expected native physical scanout was not confirmed after runtime startup; refusing render test.' }
+        $nativeWaitTold = $false
+        while ($true) {
+            & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-after-runtime-start.txt')
+            $probe = Get-Content (Join-Path $out 'physical-display-after-runtime-start.txt') -Raw
+            $match = [regex]::Match($probe, '(?m)^\s*target=' + $targetId + ' [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n[^\r\n]*(?i:' + [regex]::Escape($headsetPathId) + ')[^\r\n]*\r?\n\s*signal=1440x2560 total=1752x4078 pixelClock=571570000 vSync=(\d+)/(\d+)')
+            if ($match.Success -or (Get-Date) -gt $nativeDeadline) { break }
+            if (-not $nativeWaitTold) { Write-Output 'Waiting for the headset to come back in its native display mode...'; $nativeWaitTold = $true }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $match.Success) {
+            $modeReport = Get-ArcRiftHeadsetModeReport $probe $targetId (Test-Path -LiteralPath $edidKey)
+            $osNote = if ([Environment]::OSVersion.Version.Build -lt 22000) { ' This PC runs Windows 10; ArcRift is only tested on Windows 11.' } else { '' }
+            throw ('Expected native physical scanout was not confirmed within 45 s after the headset monitor restart; refusing render test. Found: ' + $modeReport + '.' + $osNote)
+        }
         $hz = [double]$match.Groups[1].Value / [double]$match.Groups[2].Value
         if ($hz -lt 79 -or $hz -gt 81) { throw 'Native scanout refresh rate was unexpected.' }
         Write-Output ('Physical native scanout verified: 1440x2560 at ' + $hz + ' Hz.')
@@ -552,6 +672,82 @@ try {
         }
         Write-Output 'Native desktop verified. Full EDID/runtime rollback is managed and verified by this harness; source-only timeout restore is NOT guaranteed.'
     }
+    if ($GuardianSetup) {
+        # Release 1.2.1: Guardian setup. Meta runs it inside Dash; ArcRift only watches and guards, then restores on Stop.
+        'Guardian setup session (Meta Dash allowed, SteamVR not started).' | Set-Content (Join-Path $out 'guardian-setup.txt')
+        $guardianDir = Join-Path $env:LOCALAPPDATA 'Oculus'
+        $guardianSaved = $false
+        $dashIds = @{}
+        $dashStarts = New-Object System.Collections.Generic.List[datetime]
+        $observationStart = Get-Date
+        $nextEventCheck = Get-Date
+        $readyWritten = $false
+        $bridgeFpsPrevTick = $null; $bridgeLowFpsCount = 0
+        Write-Output 'Put the headset on. Meta should show its Guardian setup (your room through the headset cameras): follow it and draw your play area with a controller. If Meta shows its home screen instead, open Settings > Guardian > Set up Guardian there.'
+        while ($true) {
+            if (Test-Path (Join-Path $out 'session-stop.txt')) { $userStopRequested = $true; Write-Output 'User requested stop; performing full rollback.'; break }
+            if ($recoveryWatcher.HasExited) { throw 'Independent manual-session recovery watcher exited; stopping session.' }
+            if ((Get-Date) -ge $manualDiskCheckAt) {
+                $drive = New-Object IO.DriveInfo([IO.Path]::GetPathRoot($root))
+                if ($drive.AvailableFreeSpace -lt 1GB) { throw 'Low disk space: stopping the session.' }
+                $manualDiskCheckAt = (Get-Date).AddSeconds(30)
+            }
+            $server = @(Get-Process OVRServer_x64 -ErrorAction SilentlyContinue)
+            if ($server.Count -ne 1 -or $server[0].Id -ne $serverId) { throw 'Meta runtime exited or restarted during Guardian setup.' }
+            if ($sourceHelper -and $sourceHelper.HasExited) { throw 'Native source helper exited during Guardian setup.' }
+            # Dash may restart on its own; a crash loop means it does not work on this GPU.
+            foreach ($d in @(Get-Process OculusDash -ErrorAction SilentlyContinue)) {
+                if (-not $dashIds.ContainsKey($d.Id)) {
+                    $dashIds[$d.Id] = $true; $dashStarts.Add((Get-Date))
+                    ('At ' + (Get-Date).ToString('o') + ': OculusDash PID=' + $d.Id + ' started') | Add-Content (Join-Path $out 'guardian-dash.txt')
+                    if ($dashIds.Count -eq 1) { Write-Output 'Meta Dash started.' } else { Write-Output ('Meta Dash restarted (start ' + $dashIds.Count + ').') }
+                }
+            }
+            while ($dashStarts.Count -and ((Get-Date) - $dashStarts[0]).TotalSeconds -gt 120) { $dashStarts.RemoveAt(0) }
+            if ($dashStarts.Count -ge 4) { throw 'Meta Dash keeps crashing and restarting on this GPU (4 starts in 2 minutes), so Guardian setup cannot run. Restoring.' }
+            if (-not $readyWritten -and ((Get-Date) - $observationStart).TotalSeconds -gt 3) {
+                'Guardian setup session running. Optical verification is user-reported.' | Out-File (Join-Path $out 'session-ready.txt')
+                $readyWritten = $true
+            }
+            # Same graphics guards as a normal session.
+            $newLog = Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogOffset) -OnlyIfGrown
+            $candidateLogTail += $newLog
+            if ($candidateLogTail.Length -gt 8192) { $candidateLogTail = $candidateLogTail.Substring($candidateLogTail.Length-8192) }
+            if ($candidateLogTail -match '(?i:Renderer failed|Surface failed|Present frame=\d+ result=(?!00000000)[a-f0-9]{8}|Legacy Present health[^\r\n]*slow=1)') { throw 'Headset graphics failure or >100ms presentation stall detected; restoring.' }
+            foreach ($m in [regex]::Matches($newLog,'(?m)^(\d+) Output surface frame=(\d+)')) {
+                $tick=[double]$m.Groups[1].Value; $frame=[double]$m.Groups[2].Value
+                if ($null -ne $bridgeFpsPrevTick -and $frame -gt $bridgeFpsPrevFrame -and $tick -gt $bridgeFpsPrevTick) {
+                    $fps=($frame-$bridgeFpsPrevFrame)*1000.0/($tick-$bridgeFpsPrevTick)
+                    # Stop only below 5 fps (was 45). A 120-frame sample that slow takes over 24 s to arrive.
+                    if ($fps -lt 5) {
+                        $bridgeLowFpsCount++
+                        ('At ' + (Get-Date).ToString('o') + ': headset output ' + [math]::Round($fps,1) + ' fps (low sample ' + $bridgeLowFpsCount + ')') | Add-Content (Join-Path $out 'sync-hiccups.txt')
+                    } else { $bridgeLowFpsCount = 0 }
+                    if ($bridgeLowFpsCount -ge 2) { throw 'Headset output dropped below 5 fps for 2 consecutive samples during Guardian setup; restoring.' }
+                }
+                $bridgeFpsPrevTick=$tick; $bridgeFpsPrevFrame=$frame
+            }
+            if ((Get-Date) -ge $nextEventCheck) {
+                if (@(Get-WinEvent -FilterHashtable @{LogName='System';Id=4101;StartTime=$start} -ErrorAction SilentlyContinue).Count) { throw 'Windows reported a display-driver recovery during Guardian setup.' }
+                $nextEventCheck = (Get-Date).AddSeconds(1)
+                # Meta logs every Guardian change to GuardianBoundary_*.txt; a mode other than "off" with an outline means it is saved.
+                if (-not $guardianSaved) {
+                    $gb = Get-ChildItem $guardianDir -Filter 'GuardianBoundary_*.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    if ($gb) {
+                        $gbText = Get-Content -LiteralPath $gb.FullName -Raw -ErrorAction SilentlyContinue
+                        if ($gbText -match '"mode"\s*:\s*"(?!off")[a-z_]+"' -and $gbText -match '"outerBoundary"\s*:\s*\[\s*\[') {
+                            $guardianSaved = $true
+                            Copy-Item -LiteralPath $gb.FullName -Destination (Join-Path $out 'guardian-boundary.txt') -ErrorAction SilentlyContinue
+                            'Guardian boundary saved by Meta.' | Set-Content (Join-Path $out 'guardian-saved.txt')
+                            Write-Output 'Guardian saved by Meta. Take the headset off and press Stop & restore. Your next normal session should show the Guardian.'
+                        }
+                    }
+                }
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $guardianSaved) { Write-Output 'Stopped before Meta saved a Guardian.' }
+    } else {
     $clientArgs = '--render'
     if ($Visual) { $clientArgs = '--render-long' }
     if ($Stereo) { $clientArgs = '--stereo-pattern' }
@@ -697,7 +893,7 @@ try {
             if ($client.HasExited) { throw 'Normal-user diagnostic exited during SteamVR trial.' }
         }
         if ($guardedTrial) {
-            $newLog = Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogOffset)
+            $newLog = Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogOffset) -OnlyIfGrown
             $candidateLogTail += $newLog
             if ($candidateLogTail.Length -gt 8192) { $candidateLogTail = $candidateLogTail.Substring($candidateLogTail.Length-8192) }
             if ($isolatedRendererTrial) {
@@ -707,16 +903,17 @@ try {
                 if ($candidateLogTail -match '(?i:Renderer failed|Surface failed|Present frame=\d+ result=(?!00000000)[a-f0-9]{8}|Legacy Present health[^\r\n]*slow=1)') { throw 'Legacy backend graphics failure or >100ms presentation stall detected.' }
                 if ($newLog -match 'Present frame=|Output surface frame=|Legacy Present health') { $candidateLastHealth = Get-Date }
                 if ($ManualSession) {
-                    # Manual session: stop if headset output drops below 45 fps for 2 consecutive 120-frame samples.
+                    # Manual session: slow headset output no longer stops the session by itself. Samples under 20 fps are
+                    # only noted in sync-hiccups.txt; the one frame-rate stop is the 5 fps limit below ($freezeSeconds).
+                    # (Was: stop under 45 fps, then under 20 fps, for 2 consecutive 120-frame samples.)
                     foreach ($m in [regex]::Matches($newLog,'(?m)^(\d+) Output surface frame=(\d+)')) {
                         $tick=[double]$m.Groups[1].Value; $frame=[double]$m.Groups[2].Value
                         if ($null -ne $bridgeFpsPrevTick -and $frame -gt $bridgeFpsPrevFrame -and $tick -gt $bridgeFpsPrevTick) {
                             $fps=($frame-$bridgeFpsPrevFrame)*1000.0/($tick-$bridgeFpsPrevTick)
-                            if ($fps -lt 45) {
+                            if ($fps -lt 20) {
                                 $bridgeLowFpsCount++
-                                ('At ' + (Get-Date).ToString('o') + ': headset output ' + [math]::Round($fps,1) + ' fps (low sample ' + $bridgeLowFpsCount + ')') | Add-Content (Join-Path $out 'sync-hiccups.txt')
+                                ('At ' + (Get-Date).ToString('o') + ': headset output ' + [math]::Round($fps,1) + ' fps (low sample ' + $bridgeLowFpsCount + '; session continues)') | Add-Content (Join-Path $out 'sync-hiccups.txt')
                             } else { $bridgeLowFpsCount = 0 }
-                            if ($bridgeLowFpsCount -ge 2) { throw 'Headset output dropped below 45 fps for 2 consecutive samples; aborting rather than waiting through corruption.' }
                         }
                         $bridgeFpsPrevTick=$tick; $bridgeFpsPrevFrame=$frame
                     }
@@ -751,8 +948,8 @@ try {
                         } elseif ($metaLine -match 'Proximity state changed \(0 -> 1\)|Broadcasting HMD mounted event') {
                             if ($headsetOff) {
                                 $headsetOff = $false
-                                $candidateLastHealth = (Get-Date).AddSeconds(5); $bridgeFpsPrevTick = $null; $bridgeLowFpsCount = 0
-                                Write-Output 'Headset on: freeze check resumes after an 8-second grace period.'
+                                $candidateLastHealth = Get-Date; $bridgeFpsPrevTick = $null; $bridgeLowFpsCount = 0
+                                Write-Output 'Headset on: freeze check resumes after a 24-second grace period.'
                                 ('At ' + (Get-Date).ToString('o') + ': headset on, freeze check resumes') | Add-Content (Join-Path $out 'sync-hiccups.txt')
                             }
                         }
@@ -765,7 +962,16 @@ try {
                 }
                 if ($headsetOff) { $candidateLastHealth = Get-Date }
             }
-            if (((Get-Date)-$observationStart).TotalSeconds -gt $warmupSeconds -and ((Get-Date)-$candidateLastHealth).TotalSeconds -gt 3) { throw 'Backend presentation health log stopped progressing.' }
+            # The bridge logs one line per 120 frames, so the time allowed between lines sets the lowest frame rate a
+            # session survives: 3 s = 40 fps for the short guarded trials. Manual sessions allow 24 s = 5 fps, the only
+            # frame-rate stop they have (it was 10 s, which stopped anything under 12 fps). A real freeze logs nothing
+            # at all, so it now stops after 24 s instead of 10 s.
+            $freezeSeconds = 3
+            if ($ManualSession) { $freezeSeconds = 24 }
+            if (((Get-Date)-$observationStart).TotalSeconds -gt $warmupSeconds -and ((Get-Date)-$candidateLastHealth).TotalSeconds -gt $freezeSeconds) {
+                if ($ManualSession) { throw 'Headset output dropped below 5 fps or froze (fewer than 120 frames in 24 s); stopping and restoring.' }
+                throw ('Backend presentation health log stopped progressing (no headset frames for ' + $freezeSeconds + ' s).')
+            }
             if ($guardedSteamTrial) {
                 if ($ManualSession) {
                     # Manual session: tolerate isolated sync hiccups (seen when VRChat launches), stop on floods or device loss.
@@ -788,13 +994,12 @@ try {
                             while ($syncHiccupTimes.Count -and ($syncNow - $syncHiccupTimes[0]).TotalSeconds -gt 30) { $syncHiccupTimes.RemoveAt(0) }
                             ('At ' + $syncNow.ToString('o') + ' (' + $syncHiccupTimes.Count + ' hitches in last 30s): ' + $syncLine.Trim()) | Add-Content (Join-Path $out 'sync-hiccups.txt')
                             # A slow game (e.g. VRChat CPU-bound in a busy world) floods these too; the headset frame-rate,
-                            # stall and device-loss guards cover real presentation trouble, so only stop on a long flood.
+                            # stall and device-loss guards cover real presentation trouble, so sync errors are only noted and never stop
+                            # the session. (Was: stop after more than 20 in 30 s for 2 minutes.)
                             if ($syncHiccupTimes.Count -gt 20) {
                                 if (-not $syncFloodSince) {
                                     $syncFloodSince = $syncNow
-                                    Write-Output 'SteamVR sync errors high (game running slowly). Session continues; it stops if this lasts 2 minutes. Lower game settings if you can.'
-                                } elseif (($syncNow - $syncFloodSince).TotalSeconds -gt 120) {
-                                    throw 'Sustained SteamVR sync hitches (more than 20 in 30s for 2 minutes); aborting rather than waiting through corruption.'
+                                    Write-Output 'SteamVR sync errors high (game running slowly). Session continues; sync errors alone never stop it. Lower game settings if you can.'
                                 }
                             }
                             if ($syncLine -match '(?i:AcquireSync FAILED)' -and $syncLine -match '(?i:OMITTING additional logs)') { Write-Output 'SteamVR sync burst (SteamVR hid further warnings for 30s). Headset frame-rate and stall guards still active.' }
@@ -930,6 +1135,7 @@ public static class ArcRiftGpuPriority {
             if ($candidateLogTail -match '(?i:Isolated[^\r\n]*(?:failed|failure|stalled|exceeded|exception|faulted=1))') { throw 'Isolated backend fault detected at trial end.' }
         }
     }
+    } # Release 1.2.1: end of the normal (non-Guardian) session path
 } catch {
     $failed = $true
     Write-Output ('TEST STOP: ' + $_.Exception.Message)
@@ -988,7 +1194,10 @@ public static class ArcRiftGpuPriority {
         Get-Content (Join-Path $out 'native-source.txt') -ErrorAction Continue
     }
     if ($changed) {
+        # Release 1.2.1: Guardian setup let Meta's Dash run; close it before and after stopping Meta's runtime.
+        if ($GuardianSetup) { Get-Process OculusDash -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Continue }
         try { Stop-ArcRiftMetaRuntime } catch { $failed = $true; Write-Output ('RUNTIME STOP ERROR: ' + $_.Exception.Message) }
+        if ($GuardianSetup) { Get-Process OculusDash -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Continue }
         # Only this session's part of the bridge log, not every earlier session's lines again.
         try { [IO.File]::WriteAllText((Join-Path $out 'bridge-log.txt'), (Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogSessionStart))) }
         catch { Write-Output ('Bridge log copy note (rollback unaffected): ' + $_.Exception.Message) }

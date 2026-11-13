@@ -11,6 +11,7 @@ import (
 	"errors"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -30,7 +31,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const appVersion = "1.1.2"
+const appVersion = "1.3"
 
 var (
 	root      string
@@ -133,14 +134,84 @@ func harnessRunning(procs map[string][]uint32, pid int, started time.Time) bool 
 	return !created.After(started.Add(5 * time.Second))
 }
 
-// lockHeld reports whether a session or recovery currently holds active-test.lock (they open it without sharing).
-func lockHeld() bool {
-	f, err := os.Open(filepath.Join(root, "active-test.lock"))
+// lockHeld reports whether a session or recovery currently holds pkg's active-test.lock (they open it without sharing).
+func lockHeld(pkg string) bool {
+	f, err := openShared(filepath.Join(pkg, "active-test.lock"))
 	if err == nil {
 		f.Close()
 		return false
 	}
 	return errors.Is(err, syscall.Errno(32)) // ERROR_SHARING_VIOLATION
+}
+
+// markerState reads one ArcRift folder's active-test.xml: state is "" when there is no marker, else
+// starting/running/stopping/idle (cleanup verified)/recovering/recovery.
+func markerState(pkg string, procs map[string][]uint32) (state, sessionDir string, harnessAlive bool) {
+	marker := readText(filepath.Join(pkg, "active-test.xml"), 0)
+	if marker == "" {
+		return "", "", false
+	}
+	if m := reSessionDir.FindStringSubmatch(marker); m != nil {
+		sessionDir = xmlUnescape(m[1])
+	}
+	pid := 0
+	if m := reHarnessPid.FindStringSubmatch(marker); m != nil {
+		pid, _ = strconv.Atoi(m[1])
+	}
+	var started time.Time
+	if m := reStarted.FindStringSubmatch(marker); m != nil {
+		started, _ = time.Parse(time.RFC3339Nano, m[1])
+	}
+	harnessAlive = harnessRunning(procs, pid, started)
+	cleaned := false
+	if m := reCleanup.FindStringSubmatch(readText(filepath.Join(sessionDir, "manual-recovery-state.json"), 0)); m != nil {
+		cleaned = m[1] == "true"
+	}
+	switch {
+	case harnessAlive && fileExists(filepath.Join(sessionDir, "session-stop.txt")):
+		state = "stopping"
+	case harnessAlive && strings.Contains(readText(filepath.Join(sessionDir, "transcript.txt"), 256*1024), "TEST STOP"):
+		state = "stopping"
+	case harnessAlive && fileExists(filepath.Join(sessionDir, "session-ready.txt")):
+		state = "running"
+	case harnessAlive:
+		state = "starting"
+	case cleaned:
+		state = "idle"
+	case lockHeld(pkg):
+		state = "recovering" // the automatic recovery watcher (or Recover) is restoring right now
+	default:
+		state = "recovery"
+	}
+	return state, sessionDir, harnessAlive
+}
+
+// foreignLeftover (1.2.1) finds another ArcRift copy whose session was never restored, for example because the PC
+// was shut down during a session started from it: first the folder of the bridge Meta is still configured to use,
+// then sibling folders. Returns "" when there is none.
+func foreignLeftover(procs map[string][]uint32) (pkg, state, sessionDir string) {
+	var cands []string
+	if dll := regString(syscall.HKEY_LOCAL_MACHINE, `SOFTWARE\Oculus`, "DirectDisplayDLL"); strings.HasPrefix(strings.ToLower(filepath.Base(dll)), "arc_rift_bridge") {
+		cands = append(cands, filepath.Dir(dll))
+	}
+	parent := filepath.Dir(root)
+	if entries, err := os.ReadDir(parent); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				cands = append(cands, filepath.Join(parent, e.Name()))
+			}
+		}
+	}
+	for _, c := range cands {
+		c = filepath.Clean(c)
+		if strings.EqualFold(c, filepath.Clean(root)) || !fileExists(filepath.Join(c, "active-test.xml")) || !fileExists(filepath.Join(c, "test-ovr-d3d11.ps1")) {
+			continue
+		}
+		if st, dir, _ := markerState(c, procs); st == "recovery" || st == "recovering" {
+			return c, st, dir
+		}
+	}
+	return "", "", ""
 }
 
 // regString reads a string value from the registry; "" if it is missing.
@@ -195,22 +266,39 @@ func xmlUnescape(s string) string {
 	return r.Replace(s)
 }
 
+// openShared opens a file for reading without stopping another program from deleting or replacing it meanwhile.
+// os.Open does not allow that on Windows, so a status poll that happened to be reading active-test.xml or
+// boundary-status.json could make the session script's delete, or the boundary helper's update, fail.
+func openShared(path string) (*os.File, error) {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	h, err := syscall.CreateFile(p, syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
+		nil, syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
+}
+
 func readText(path string, max int64) string {
-	f, err := os.Open(path)
+	f, err := openShared(path)
 	if err != nil {
 		return ""
 	}
 	defer f.Close()
+	if max <= 0 {
+		b, _ := io.ReadAll(f)
+		return decodeText(b)
+	}
 	st, _ := f.Stat()
-	if st != nil && max > 0 && st.Size() > max {
+	if st != nil && st.Size() > max {
 		f.Seek(st.Size()-max, 0)
 	}
 	b := make([]byte, max)
-	if max <= 0 {
-		b, _ = os.ReadFile(path)
-		return decodeText(b)
-	}
-	n, _ := f.Read(b)
+	n, _ := io.ReadFull(f, b)
 	return decodeText(b[:n])
 }
 
@@ -393,6 +481,91 @@ func refreshSlow() {
 	cacheMu.Unlock()
 }
 
+// ---------- room boundary (1.2.1) ----------
+
+// boundaryStatus reads boundary-status.json written by arcrift_boundary.exe; nil if there is none.
+// A countdown/recording/active state whose helper process is gone is reported as "off".
+func boundaryStatus() map[string]any {
+	var b map[string]any
+	if json.Unmarshal([]byte(readText(filepath.Join(root, "boundary-status.json"), 0)), &b) != nil {
+		return nil
+	}
+	switch b["state"] {
+	case "countdown", "waiting", "recording", "active":
+		pid, _ := b["pid"].(float64)
+		if !pidAlive(processList(), int(pid)) {
+			b["state"] = "off"
+			b["message"] = "Boundary is off."
+		}
+	}
+	return b
+}
+
+// boundarySavedKind says how the saved boundary lines up again: "box" (quick box: stand in its middle), "controller"
+// (traced with a trigger: controller on the starting spot) or "headset" (walked: headset on the starting spot); "" if none.
+func boundarySavedKind() string {
+	text := readText(filepath.Join(root, "boundary-saved.txt"), 0)
+	switch {
+	case text == "":
+		return ""
+	case strings.Contains(text, "\nshape box"):
+		return "box"
+	case strings.Contains(text, "\nanchor controller"):
+		return "controller"
+	}
+	return "headset"
+}
+
+// boundaryCommand runs arcrift_boundary.exe box|draw|apply|clear|finish as the normal user, like SteamVR itself.
+// width and depth (metres) are only used by "box".
+func boundaryCommand(do, width, depth string) (string, error) {
+	args := []string{do}
+	switch do {
+	case "box", "draw", "apply":
+		if status()["state"] != "running" {
+			return "", fmt.Errorf("start a VR session first and wait until it says Running")
+		}
+		if do == "apply" && !fileExists(filepath.Join(root, "boundary-saved.txt")) {
+			return "", fmt.Errorf("there is no saved boundary yet: use Box around me or Draw boundary first")
+		}
+		if do == "box" {
+			w, errW := strconv.ParseFloat(width, 64)
+			d, errD := strconv.ParseFloat(depth, 64)
+			if errW != nil || errD != nil || w < 1 || w > 8 || d < 1 || d > 8 {
+				return "", fmt.Errorf("the box must be between 1 and 8 m on each side")
+			}
+			args = append(args, strconv.FormatFloat(w, 'f', 2, 64), strconv.FormatFloat(d, 'f', 2, 64))
+		}
+	case "clear", "finish":
+	default:
+		return "", fmt.Errorf("unknown boundary command")
+	}
+	kind := boundarySavedKind()
+	cmd := hidden(exec.Command(filepath.Join(root, "arcrift_boundary.exe"), args...))
+	cmd.Dir = root
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("could not start arcrift_boundary.exe: %v", err)
+	}
+	go cmd.Wait()
+	switch do {
+	case "box":
+		return "10 seconds: put the headset on, stand in the middle of your play space and face forward. Two beeps mean the box is placed.", nil
+	case "draw":
+		return "Ready: hold a controller trigger at the edge of your play space to start tracing.", nil
+	case "apply":
+		if kind == "box" {
+			return "15 seconds: put the headset on, stand in the middle of your play space and face the same way as when you made the box.", nil
+		}
+		if kind == "headset" {
+			return "15 seconds: stand on the spot where you started, facing the same way, holding the headset the same way.", nil
+		}
+		return "Hold a controller on your starting spot, pointing the same way as when you drew it, and pull the trigger.", nil
+	case "finish":
+		return "Finishing with what was recorded so far.", nil
+	}
+	return "Boundary removed.", nil
+}
+
 // ---------- status ----------
 
 func status() map[string]any {
@@ -401,50 +574,23 @@ func status() map[string]any {
 	has := func(n string) bool { return len(procs[strings.ToLower(n)]) > 0 }
 	s := map[string]any{"version": appVersion, "root": root}
 
-	marker := readText(filepath.Join(root, "active-test.xml"), 0)
-	state := "idle"
-	sessionDir := ""
-	harnessAlive := false
-	if marker != "" {
-		if m := reSessionDir.FindStringSubmatch(marker); m != nil {
-			sessionDir = xmlUnescape(m[1])
-		}
-		pid := 0
-		if m := reHarnessPid.FindStringSubmatch(marker); m != nil {
-			pid, _ = strconv.Atoi(m[1])
-		}
-		var started time.Time
-		if m := reStarted.FindStringSubmatch(marker); m != nil {
-			started, _ = time.Parse(time.RFC3339Nano, m[1])
-		}
-		harnessAlive = harnessRunning(procs, pid, started)
-		cleaned := false
-		if m := reCleanup.FindStringSubmatch(readText(filepath.Join(sessionDir, "manual-recovery-state.json"), 0)); m != nil {
-			cleaned = m[1] == "true"
-		}
-		switch {
-		case harnessAlive && fileExists(filepath.Join(sessionDir, "session-stop.txt")):
-			state = "stopping"
-		case harnessAlive && strings.Contains(readText(filepath.Join(sessionDir, "transcript.txt"), 256*1024), "TEST STOP"):
-			state = "stopping"
-		case harnessAlive && fileExists(filepath.Join(sessionDir, "session-ready.txt")):
-			state = "running"
-		case harnessAlive:
-			state = "starting"
-		case cleaned:
-			state = "idle"
-		case lockHeld():
-			state = "recovering" // the automatic recovery watcher (or Recover) is restoring right now
-		default:
-			state = "recovery"
-		}
-	} else {
+	state, sessionDir, harnessAlive := markerState(root, procs)
+	foreignRoot := ""
+	if state == "" {
+		state = "idle"
 		wrapperMu.Lock()
 		if !wrapperDone {
 			state = "starting"
 		}
 		wrapperMu.Unlock()
+		if state == "idle" {
+			// 1.2.1: another ArcRift copy may have left a session unrestored (PC shut down during a session there).
+			if pkg, fst, fdir := foreignLeftover(procs); pkg != "" {
+				state, sessionDir, foreignRoot = fst, fdir, pkg
+			}
+		}
 	}
+	s["foreignRoot"] = foreignRoot
 	logDir := sessionDir
 	if logDir == "" {
 		logDir = latestSessionDir()
@@ -494,11 +640,18 @@ func status() map[string]any {
 		missing = append(missing, "release-manifest.json")
 	}
 	s["missingPrograms"] = missing
+	s["boundary"] = boundaryStatus()
+	s["boundarySaved"] = fileExists(filepath.Join(root, "boundary-saved.txt"))
+	s["boundarySavedKind"] = boundarySavedKind()
+	// 1.2.1: experimental Guardian setup session (Meta Dash allowed) and whether Meta has a Guardian saved.
+	s["guardianSession"] = sessionDir != "" && fileExists(filepath.Join(sessionDir, "guardian-setup.txt"))
+	s["guardianSavedNow"] = sessionDir != "" && fileExists(filepath.Join(sessionDir, "guardian-saved.txt"))
+	s["guardianMode"] = metaGuardianMode()
 	s["presentmonAvailable"] = fileExists(filepath.Join(root, "PresentMon.exe"))
 	return s
 }
 
-var releasePrograms = []string{"arc_rift_bridge.dll", "native_source_test.exe", "native_source_session.exe", "display_probe.exe", "bridge_selftest.exe"}
+var releasePrograms = []string{"arc_rift_bridge.dll", "native_source_test.exe", "native_source_session.exe", "display_probe.exe", "bridge_selftest.exe", "arcrift_boundary.exe"}
 
 // GPUs a full VRChat session has been confirmed on. Other Intel GPUs are allowed but marked untested.
 var testedGPUs = map[string]string{"VEN_8086&DEV_56A0": "Intel Arc A770"}
@@ -530,11 +683,40 @@ func fileExists(p string) bool {
 
 // ---------- actions ----------
 
-func startSession() (string, error) {
+// metaGuardianMode reads Meta's newest GuardianBoundary log: "" if unknown, "off" if no Guardian, else its mode.
+func metaGuardianMode() string {
+	files, _ := filepath.Glob(filepath.Join(os.Getenv("LOCALAPPDATA"), "Oculus", "GuardianBoundary_*.txt"))
+	best, bestTime := "", time.Time{}
+	for _, f := range files {
+		if st, err := os.Stat(f); err == nil && st.Size() > 0 && st.ModTime().After(bestTime) {
+			best, bestTime = f, st.ModTime()
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	m := reGuardianMode.FindAllStringSubmatch(readText(best, 0), -1)
+	if len(m) == 0 {
+		return ""
+	}
+	return m[len(m)-1][1]
+}
+
+var reGuardianMode = regexp.MustCompile(`"mode"\s*:\s*"([a-zA-Z_]+)"`)
+
+func startSession(guardian bool) (string, error) {
+	// 1.2.1: tested on an Arc A770 (2026-11-04): Meta's Dash renders with Vulkan and Meta reports the Arc card as not
+	// Vulkan-capable, so Dash quits on every launch ("Failed to configure Rendering Code: -4"). Guardian setup cannot
+	// run; refuse it instead of starting a session that can only crash-loop and stop.
+	if guardian {
+		return "", fmt.Errorf("Meta Guardian setup does not work on Intel Arc: Meta's Dash needs Vulkan, which Meta does not support on this card. Use Draw boundary instead")
+	}
 	startMu.Lock()
 	defer startMu.Unlock()
 	st := status()
-	if st["state"] != "idle" {
+	// 1.2.1: "recovery" is allowed: the session restores the unrestored last session automatically before starting.
+	recovering := st["state"] == "recovery"
+	if st["state"] != "idle" && !recovering {
 		return "", fmt.Errorf("a session is already %v", st["state"])
 	}
 	if st["config"] == nil {
@@ -546,7 +728,11 @@ func startSession() (string, error) {
 	if m, _ := st["missingPrograms"].([]string); len(m) > 0 {
 		return "", fmt.Errorf("programs are missing (%s). Run BUILD-RELEASE.cmd or reinstall the release", strings.Join(m, ", "))
 	}
-	cmd := psFile("start-vrchat-trial.ps1", "-ManualSession")
+	args := []string{"-ManualSession"}
+	if guardian {
+		args = append(args, "-GuardianSetup")
+	}
+	cmd := psFile("start-vrchat-trial.ps1", args...)
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
@@ -559,6 +745,12 @@ func startSession() (string, error) {
 		wrapperDone = true
 		wrapperMu.Unlock()
 	}()
+	if guardian {
+		return "Starting the Guardian setup session. Approve the Windows administrator prompt; a PowerShell window opens and must stay open. Then put the headset on.", nil
+	}
+	if recovering {
+		return "Restoring the last session first, then starting. Approve the Windows administrator prompt; a PowerShell window opens and must stay open. Keep the headset plugged in.", nil
+	}
 	return "Starting. Approve the Windows administrator prompt; a PowerShell window opens and must stay open.", nil
 }
 
@@ -713,10 +905,51 @@ func analyzeSetup() map[string]any {
 			oculusUSB++
 		}
 	}
+	// 1.3 (other Intel cards): ask Windows which graphics card the headset display is plugged into, instead of
+	// guessing by name. The bridge only accepts that exact card, and a name guess can pick the wrong one on a PC with
+	// two Intel adapters (processor graphics that is also called "Arc", or two Arc cards).
+	gpuWarning := ""
+	if adapter := headsetAdapter(id.MonitorInstance); pnpVenDev(adapter) != "" {
+		id.GPUPnpMatch = pnpVenDev(adapter)
+		id.GPUName = id.GPUPnpMatch
+		for _, g := range setupGPU {
+			if strings.EqualFold(g.PNPDeviceID, adapter) {
+				id.GPUName = g.Name
+				break
+			}
+			if id.GPUName == id.GPUPnpMatch && pnpVenDev(g.PNPDeviceID) == id.GPUPnpMatch {
+				id.GPUName = g.Name
+			}
+		}
+		// The headset is on some other card while an Arc card is present: say which cable to move.
+		if !strings.Contains(strings.ToLower(id.GPUName), "arc") {
+			for _, g := range setupGPU {
+				if strings.Contains(strings.ToUpper(g.PNPDeviceID), "VEN_8086") && strings.Contains(strings.ToLower(g.Name), "arc") && pnpVenDev(g.PNPDeviceID) != id.GPUPnpMatch {
+					gpuWarning = "The headset's DisplayPort cable is plugged into " + id.GPUName + ", not into " + g.Name + ". Plug it into the Arc card, then run Setup again."
+					break
+				}
+			}
+		}
+	}
+	// Fallback when Windows did not say (older behaviour). A PC can have two Intel adapters: the processor's built-in
+	// graphics and the Arc card. Prefer the one named "Arc"; else the first Intel one.
+	fromAdapter := id.GPUPnpMatch != ""
+	intelPicked := false
 	for _, g := range setupGPU {
-		if strings.Contains(strings.ToUpper(g.PNPDeviceID), "VEN_8086") {
+		if fromAdapter {
+			break
+		}
+		if !strings.Contains(strings.ToUpper(g.PNPDeviceID), "VEN_8086") {
+			continue
+		}
+		arc := strings.Contains(strings.ToLower(g.Name), "arc")
+		if !intelPicked || arc {
 			id.GPUName = g.Name
 			id.GPUPnpMatch = pnpVenDev(g.PNPDeviceID)
+			intelPicked = true
+		}
+		if arc {
+			break
 		}
 	}
 	if id.GPUName == "" && len(setupGPU) > 0 {
@@ -736,10 +969,27 @@ func analyzeSetup() map[string]any {
 	if oculusUSB == 0 && len(headset) > 0 {
 		warnings = append(warnings, "No Meta/Oculus USB devices (VID_2833) were among the changed devices.")
 	}
+	if gpuWarning != "" {
+		warnings = append(warnings, gpuWarning)
+	}
 	res["identity"] = id
 	res["warnings"] = warnings
 	res["compatible"] = compatible(id)
 	return res
+}
+
+// headsetAdapter (1.3) asks Windows which graphics card a monitor is plugged into: a monitor's parent device is its
+// display adapter. Returns that adapter's PnP ID (for example PCI\VEN_8086&DEV_E20B&...), or "" if it cannot be read.
+func headsetAdapter(monitorInstance string) string {
+	if monitorInstance == "" {
+		return ""
+	}
+	quoted := strings.ReplaceAll(monitorInstance, "'", "''")
+	out, err := psCommand(`(Get-PnpDeviceProperty -InstanceId '` + quoted + `' -KeyName DEVPKEY_Device_Parent -ErrorAction SilentlyContinue).Data`).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(decodeText(out))
 }
 
 func pnpVenDev(p string) string {
@@ -791,7 +1041,7 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	mux.HandleFunc("/api/status", api(func(r *http.Request) (any, error) { return status(), nil }))
 	mux.HandleFunc("/api/start", api(func(r *http.Request) (any, error) {
-		m, err := startSession()
+		m, err := startSession(r.URL.Query().Get("mode") == "guardian")
 		if err != nil {
 			return nil, err
 		}
@@ -804,10 +1054,15 @@ func main() {
 		return map[string]any{"ok": true, "message": runCapture(psFile("stop-arc-rift.ps1"), 20*time.Second)}, nil
 	}))
 	mux.HandleFunc("/api/recover", api(func(r *http.Request) (any, error) {
-		if status()["state"] != "recovery" {
+		st := status()
+		if st["state"] != "recovery" {
 			return nil, fmt.Errorf("recovery is only for a session whose window closed before cleanup finished")
 		}
-		cmd := psFile("recover-manual-session.ps1")
+		var args []string
+		if f, _ := st["foreignRoot"].(string); f != "" {
+			args = []string{"-SessionDirectory", st["sessionDir"].(string)} // a session left by another ArcRift copy
+		}
+		cmd := psFile("recover-manual-session.ps1", args...)
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}
@@ -815,11 +1070,23 @@ func main() {
 		return map[string]any{"ok": true, "message": "Recovery started. Approve the administrator prompt; status updates when it finishes."}, nil
 	}))
 	mux.HandleFunc("/api/dismiss", api(func(r *http.Request) (any, error) {
-		if status()["state"] != "recovery" {
+		st := status()
+		if st["state"] != "recovery" {
 			return nil, fmt.Errorf("there is no session waiting for recovery")
+		}
+		if f, _ := st["foreignRoot"].(string); f != "" {
+			return nil, fmt.Errorf("this session belongs to %s: press Recover or Start to restore it", f)
 		}
 		out := runCapture(psFile("dismiss-recovery.ps1"), 30*time.Second)
 		return map[string]any{"ok": !fileExists(filepath.Join(root, "active-test.xml")), "message": out}, nil
+	}))
+	mux.HandleFunc("/api/boundary", api(func(r *http.Request) (any, error) {
+		do := r.URL.Query().Get("do")
+		msg, err := boundaryCommand(do, r.URL.Query().Get("w"), r.URL.Query().Get("d"))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "message": msg}, nil
 	}))
 	mux.HandleFunc("/api/open-folder", api(func(r *http.Request) (any, error) {
 		d := r.URL.Query().Get("which")

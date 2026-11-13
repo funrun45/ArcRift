@@ -7,9 +7,14 @@ function Start-ArcRiftNormalUserPowerShell {
         $null = & (Join-Path $PSScriptRoot 'probe-process-integrity.ps1')
     }
     $session = (Get-Process -Id $PID).SessionId
-    $explorers = @(Get-Process explorer -ErrorAction Stop | Where-Object { $_.SessionId -eq $session })
-    if ($explorers.Count -ne 1 -or [ArcRiftIntegrityProbe]::Integrity($explorers[0].Id) -ne 8192) {
-        throw 'A single Medium-integrity Explorer in the current session is required.'
+    # Release 1.3: Windows can run more than one explorer.exe (with "Launch folder windows in a separate process", or
+    # for a moment whenever a folder is opened). Only the one that owns the desktop does the launching below, so that
+    # is the one checked; requiring exactly one explorer.exe refused to start on such PCs.
+    $shellPid = [ArcRiftIntegrityProbe]::ShellProcessId()
+    $shell = if ($shellPid -gt 0) { Get-Process -Id $shellPid -ErrorAction SilentlyContinue }
+    if (-not $shell -or $shell.ProcessName -ne 'explorer' -or $shell.SessionId -ne $session -or
+        [ArcRiftIntegrityProbe]::Integrity($shellPid) -ne 8192) {
+        throw 'The Windows desktop (explorer.exe) must be running as your normal user. Restart Windows Explorer from Task Manager, then start the session again; no changes made.'
     }
     $windows = $null
     $shellWindows = $null

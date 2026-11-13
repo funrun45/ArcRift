@@ -1,7 +1,14 @@
 function Get-ArcRiftRecoveryLayouts([string]$Text) {
     $layouts = @{}
-    $pattern = '(?m)^\s*target=(\d+) [^\r\n]*pathFlags=1[^\r\n]*\r?\n[^\r\n]*\r?\n\s*(signal=[^\r\n]+)\r?\n\s*(source=[^\r\n]+)'
-    foreach ($m in [regex]::Matches($Text,$pattern)) { $layouts[$m.Groups[1].Value]=$m.Groups[2].Value.Trim()+' '+$m.Groups[3].Value.Trim() }
+    # Release 1.3: same reading as Get-ActiveLayouts in test-ovr-d3d11.ps1. Active = bit 0 of the hex path flags (not
+    # the text "pathFlags=1"); keyed by target ID and monitor path, since two adapters can share a target ID.
+    $pattern = '(?m)^\s*target=(\d+) [^\r\n]*pathFlags=[0-9a-fA-F]*[13579bdfBDF] [^\r\n]*\r?\n([^\r\n]*)\r?\n\s*(signal=[^\r\n]+)\r?\n\s*(source=[^\r\n]+)'
+    foreach ($m in [regex]::Matches($Text,$pattern)) {
+        $path=[regex]::Match($m.Groups[2].Value,'path=(\S+)')
+        $key=$m.Groups[1].Value
+        if ($path.Success) { $key+='|'+$path.Groups[1].Value.ToLowerInvariant() }
+        $layouts[$key]=$m.Groups[3].Value.Trim()+' '+$m.Groups[4].Value.Trim()
+    }
     if (-not $layouts.Count) { throw 'No display layouts parsed; recovery cannot claim success.' }
     return $layouts
 }

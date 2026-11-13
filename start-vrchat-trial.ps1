@@ -1,5 +1,5 @@
 # Explicit five-minute game trial; nothing is installed permanently.
-param([switch]$ManualSession)
+param([switch]$ManualSession, [switch]$GuardianSetup)
 $ErrorActionPreference = 'Stop'
 $code = 1
 try {
@@ -14,6 +14,7 @@ try {
     $harness = Join-Path $PSScriptRoot 'test-ovr-d3d11.ps1'
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $harness + '" -Visual -NativeTiming -NativeSource -SteamVR -LegacyCheckpointSteamTrial -UserLaunchSteamTrial -DashboardNormalUserTrial -VRChatTrial'
     if ($ManualSession) { $arguments += ' -ManualSession' }
+    if ($GuardianSetup) { $arguments += ' -GuardianSetup' }
     $process = Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments -PassThru
     $null = $process.Handle
     $process.WaitForExit()

@@ -39,31 +39,61 @@ struct PhysicalOutput {
     RECT rect{};
 };
 
-static bool GetPhysicalOutput(PhysicalOutput& out) {
+// Release 1.2: when the headset display cannot be matched, say why (in "why", if given), so a failed session's
+// bridge log shows the cause. The checks themselves are unchanged.
+static bool LookupFailed(char* why, size_t whySize, const char* format, ...) {
+    if (why && whySize) {
+        va_list args;
+        va_start(args, format);
+        vsnprintf(why, whySize, format, args);
+        va_end(args);
+    }
+    return false;
+}
+
+static bool GetPhysicalOutput(PhysicalOutput& out, char* why = nullptr, size_t whySize = 0) {
     UINT count = 0, modes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &count, &modes)) return false;
+    if (LONG err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &count, &modes)) return LookupFailed(why, whySize, "GetDisplayConfigBufferSizes error %ld", err);
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(count);
     std::vector<DISPLAYCONFIG_MODE_INFO> modeData(modes);
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &count, paths.data(), &modes, modeData.data(), nullptr)) return false;
+    if (LONG err = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &count, paths.data(), &modes, modeData.data(), nullptr)) return LookupFailed(why, whySize, "QueryDisplayConfig error %ld", err);
+    if (!Identity().valid) return LookupFailed(why, whySize, "identity file missing or invalid");
+    char seen[256] = "";
+    char lastMismatch[300] = "";
     for (UINT i = 0; i < count; ++i) {
-        if (!Identity().valid || paths[i].targetInfo.id != Identity().target) continue;
+        size_t used = strlen(seen);
+        if (used + 16 < sizeof(seen)) snprintf(seen + used, sizeof(seen) - used, "%s%u", used ? "," : "", paths[i].targetInfo.id);
+        if (paths[i].targetInfo.id != Identity().target) continue;
         DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
         target.header = {DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, sizeof(target), paths[i].targetInfo.adapterId, paths[i].targetInfo.id};
-        if (DisplayConfigGetDeviceInfo(&target.header)) continue;
+        if (LONG err = DisplayConfigGetDeviceInfo(&target.header)) { snprintf(lastMismatch, sizeof(lastMismatch), "target name query error %ld", err); continue; }
         // Release 1.1: exact headset device path from the identity file (stricter than the old prefix check).
-        if (!Identity().MonitorMatches(target.monitorDevicePath)) continue;
+        if (!Identity().MonitorMatches(target.monitorDevicePath)) { snprintf(lastMismatch, sizeof(lastMismatch), "monitor path %ls does not match Setup", target.monitorDevicePath); continue; }
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
         source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), paths[i].sourceInfo.adapterId, paths[i].sourceInfo.id};
-        if (DisplayConfigGetDeviceInfo(&source.header)) continue;
+        if (LONG err = DisplayConfigGetDeviceInfo(&source.header)) { snprintf(lastMismatch, sizeof(lastMismatch), "source name query error %ld", err); continue; }
         DEVMODEW mode{};
         mode.dmSize = sizeof(mode);
-        if (!EnumDisplaySettingsW(source.viewGdiDeviceName, ENUM_CURRENT_SETTINGS, &mode)) continue;
+        if (!EnumDisplaySettingsW(source.viewGdiDeviceName, ENUM_CURRENT_SETTINGS, &mode)) { snprintf(lastMismatch, sizeof(lastMismatch), "no current mode for %ls", source.viewGdiDeviceName); continue; }
         out.luid = paths[i].targetInfo.adapterId;
         wcscpy_s(out.sourceName, source.viewGdiDeviceName);
         out.rect = {mode.dmPosition.x, mode.dmPosition.y, mode.dmPosition.x + LONG(mode.dmPelsWidth), mode.dmPosition.y + LONG(mode.dmPelsHeight)};
         return true;
     }
-    return false;
+    if (lastMismatch[0]) return LookupFailed(why, whySize, "headset target %u is active but %s", Identity().target, lastMismatch);
+    return LookupFailed(why, whySize, "headset target %u is not an active Windows display (active targets: %s)", Identity().target, seen[0] ? seen : "none");
+}
+
+// Logs a failed headset-display lookup once per distinct reason, so a caller that polls cannot flood the log.
+static void TraceLookupFailure(const char* where, const char* why) {
+    static std::mutex lock;
+    static char last[512] = "";
+    char line[512];
+    snprintf(line, sizeof(line), "%s: headset display not found: %s", where, why[0] ? why : "unknown reason");
+    std::lock_guard<std::mutex> guard(lock);
+    if (strcmp(line, last) == 0) return;
+    strcpy_s(last, line);
+    Trace("%s", line);
 }
 
 
@@ -114,6 +144,7 @@ class Display final : public OVR::IDirectDisplay {
     unsigned frames = 0;
     std::vector<Surface*> ownedSurfaces;
     bool unknownPresentLogged = false;
+    bool exclusive = false; // between AcquireExclusive and ReleaseExclusive
 
     void SampleOutput(ID3D11Texture2D* source) {
         TextureSummary s;
@@ -215,12 +246,32 @@ public:
         memset(props, 0, sizeof(*props));
         // The output is physically verified; never substitute another monitor.
         PhysicalOutput output;
-        if (!GetPhysicalOutput(output)) return ovrError_Unsupported;
+        char why[400] = "";
+        if (!GetPhysicalOutput(output, why, sizeof(why))) { TraceLookupFailure("GetProperties", why); return ovrError_Unsupported; }
         memcpy(props->Luid.Reserved, &output.luid, sizeof(output.luid));
         props->OutputType = ovrDisplayOutput_DP;
         props->DongleType = ovrDisplayDongle_None;
         props->UniqueId = Identity().target;
         return ReadTestEdid(props->EdidData) ? ovrSuccess : ovrError_Unsupported;
+    }
+    // Release 1.2.1: Meta builds a new compositor (with a new D3D11 device) when an app such as Dash connects. It
+    // releases the display first, then acquires it again. Drop everything tied to the old device so nothing from two
+    // devices is ever mixed, then rebuild on the new one. Our references only: Meta keeps its own on old surfaces.
+    void ResetRenderer() {
+        chain.Reset();
+        if (window && IsWindow(window)) {
+            DWORD owner = GetWindowThreadProcessId(window, nullptr);
+            if (owner == GetCurrentThreadId()) DestroyWindow(window);
+            else { ShowWindowAsync(window, SW_HIDE); PostMessageW(window, WM_CLOSE, 0, 0); } // closed by its own thread
+        }
+        window = nullptr;
+        for (auto surface : ownedSurfaces) surface->Release();
+        ownedSurfaces.clear();
+        context.Reset();
+        device.Reset();
+        width = height = 0;
+        frames = 0;
+        unknownPresentLogged = false;
     }
     ovrResult AcquireExclusive(::IUnknown* supplied) override {
         std::lock_guard<std::mutex> guard(mutex);
@@ -229,15 +280,26 @@ public:
         HRESULT hr = supplied->QueryInterface(IID_PPV_ARGS(&suppliedDevice));
         Trace("AcquireExclusive supplied D3D11 device QI=%08lx: composited, not hardware direct mode", hr);
         if (FAILED(hr)) return ovrError_Unsupported;
-        if (chain && suppliedDevice.Get() != device.Get()) {
-            Trace("AcquireExclusive device changed while renderer active; refusing stale device reuse");
-            return ovrError_Unsupported;
+        if (device && suppliedDevice.Get() != device.Get()) {
+            if (exclusive) {
+                // Never switch devices while the current owner still holds the display.
+                Trace("AcquireExclusive device changed while renderer active; refusing stale device reuse");
+                return ovrError_Unsupported;
+            }
+            Trace("AcquireExclusive new device after release: rebuilding renderer for the new compositor");
+            ResetRenderer();
         }
         device = suppliedDevice;
         device->GetImmediateContext(&context);
+        exclusive = true;
         return ovrSuccess;
     }
-    ovrResult ReleaseExclusive() override { Trace("ReleaseExclusive"); return ovrSuccess; }
+    ovrResult ReleaseExclusive() override {
+        std::lock_guard<std::mutex> guard(mutex);
+        exclusive = false;
+        Trace("ReleaseExclusive");
+        return ovrSuccess;
+    }
     ovrResult CreateSurface(ovrModeDesc* mode, OVR::IDirectDisplaySurface** out) override {
         if (!mode || !out) return ovrError_InvalidParameter;
         *out = nullptr;
@@ -334,7 +396,8 @@ public:
         if (index != 0) return ovrError_Unsupported;
         if (!Identity().valid) { Trace("Identity file arcrift-identity.txt missing or invalid; refusing to enumerate"); return ovrError_Unsupported; }
         PhysicalOutput output;
-        if (!GetPhysicalOutput(output)) return ovrError_Unsupported;
+        char why[400] = "";
+        if (!GetPhysicalOutput(output, why, sizeof(why))) { TraceLookupFailure("Enumerate", why); return ovrError_Unsupported; }
         display->AddRef();
         *out = display;
         Trace("Enumerate verified target %u", Identity().target);

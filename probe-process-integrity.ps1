@@ -10,6 +10,15 @@ public static class ArcRiftIntegrityProbe {
     [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetTokenInformation(IntPtr token,int kind,IntPtr data,int bytes,out int needed);
     [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
     [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid,uint index);
+    [DllImport("user32.dll")] static extern IntPtr GetShellWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out int pid);
+    // Release 1.3: the process that owns the Windows desktop (the shell Explorer), or 0 if there is none.
+    public static int ShellProcessId() {
+        int pid;
+        IntPtr shell=GetShellWindow();
+        if(shell==IntPtr.Zero || GetWindowThreadProcessId(shell,out pid)==0) return 0;
+        return pid;
+    }
     public static int Integrity(int pid) {
         IntPtr process=OpenProcess(0x1000,false,pid),token=IntPtr.Zero,data=IntPtr.Zero;
         if(process==IntPtr.Zero) return -Marshal.GetLastWin32Error();
